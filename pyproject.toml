@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trexcmllib"
+version = "0.1.0"
+description = "Helpers for driving Cisco TRex nodes through CML console and STL workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["trex", "cml", "cisco", "traffic-generator", "stl"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: Other/Proprietary License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: System :: Networking",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/cisco-system-traffic-generator/trex-core"
+Repository = "https://github.com/cisco-system-traffic-generator/trex-core"
+
+[project.scripts]
+trexcmllib-open-console = "trexcmllib.examples.open_console:main"
+trexcmllib-l2-traffic = "trexcmllib.examples.run_l2_traffic:main"
+trexcmllib-l2-bidirectional = "trexcmllib.examples.run_l2_bidirectional:main"
+
+[tool.setuptools]
+include-package-data = false
+packages = ["trexcmllib", "trexcmllib.examples"]
+
+[tool.setuptools.package-dir]
+trexcmllib = "."
+"trexcmllib.examples" = "examples"
