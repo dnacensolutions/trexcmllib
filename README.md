@@ -332,15 +332,25 @@ result = traffic.run(
     tx_port=0,
     tx_src_ip="192.0.2.10",
     tx_next_hop="192.0.2.1",
+    rx_port=1,
+    rx_src_ip="192.0.2.20",
+    rx_next_hop="192.0.2.2",
     traffic_dst_ip="198.51.100.10",
 )
 
 print(result.success)
 print(result.summary["resolved_nh_mac"])
 print(result.summary["packets_sent"])
+print(result.summary["packets_received"])
+print(result.summary["packet_loss"])
 print(result.outputs["setup"])
 print(result.outputs["traffic"])
 ```
+
+Receive-side note:
+
+- unidirectional `l3` includes RX counters only when you provide `rx_port`
+- to configure that receive side cleanly, also provide `rx_src_ip` and `rx_next_hop`
 
 ## Example: Run Ping Validation
 
@@ -377,6 +387,11 @@ print(result.summary["probe_results"][0]["resolved_nh_mac"])
 print(result.summary["probe_results"][0]["replies"])
 print(result.outputs["port_0"])
 ```
+
+Important:
+
+- import `PingProbe` before building the `probes=[...]` list
+- if you omit that import, Python raises `NameError: name 'PingProbe' is not defined`
 
 ## Example: Run Bidirectional L3 Traffic
 
@@ -591,9 +606,13 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traff
   --lab-name <lab-name> \
   --node-name <node-name> \
   --packets 10 \
+  --packet-pps 50 \
   --tx-port 0 \
+  --rx-port 1 \
   --tx-src-ip 192.0.2.10 \
   --tx-next-hop 192.0.2.1 \
+  --rx-src-ip 192.0.2.20 \
+  --rx-next-hop 192.0.2.2 \
   --traffic-dst-ip 198.51.100.10
 ```
 
@@ -604,8 +623,11 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traff
   --lab-id <lab-id> \
   --node-id <node-id> \
   --tx-port 0 \
+  --rx-port 1 \
   --tx-src-ip 192.0.2.10 \
   --tx-next-hop 192.0.2.1 \
+  --rx-src-ip 192.0.2.20 \
+  --rx-next-hop 192.0.2.2 \
   --traffic-dst-ip 198.51.100.10 \
   --rate 10kpps \
   --duration 10

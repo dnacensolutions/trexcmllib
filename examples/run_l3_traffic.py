@@ -11,6 +11,8 @@ How to use:
 5. The example first configures L3 mode and resolves ARP, then sends either raw
    packets or a sustained STL stream using the resolved gateway MAC.
 6. In packet mode, optionally tune ``--packet-pps`` to reduce burst-driven loss.
+7. RX counters are included only when you provide ``--rx-port`` together with
+   ``--rx-src-ip`` and ``--rx-next-hop``.
 
 Example CLI:
     TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
@@ -21,8 +23,11 @@ Example CLI:
       --packets 10 \
       --packet-pps 50 \
       --tx-port 0 \
+      --rx-port 1 \
       --tx-src-ip 192.0.2.10 \
       --tx-next-hop 192.0.2.1 \
+      --rx-src-ip 192.0.2.20 \
+      --rx-next-hop 192.0.2.2 \
       --traffic-dst-ip 198.51.100.10
 
 Stream CLI:
@@ -32,8 +37,11 @@ Stream CLI:
       --lab-id <lab-id> \
       --node-name <node-name> \
       --tx-port 0 \
+      --rx-port 1 \
       --tx-src-ip 192.0.2.10 \
       --tx-next-hop 192.0.2.1 \
+      --rx-src-ip 192.0.2.20 \
+      --rx-next-hop 192.0.2.2 \
       --traffic-dst-ip 198.51.100.10 \
       --rate 10kpps \
       --duration 10
@@ -65,9 +73,13 @@ def build_parser() -> argparse.ArgumentParser:
             "    --lab-name <lab-name> \\\n"
             "    --node-name <node-name> \\\n"
             "    --packets 10 \\\n"
+            "    --packet-pps 50 \\\n"
             "    --tx-port 0 \\\n"
+            "    --rx-port 1 \\\n"
             "    --tx-src-ip 192.0.2.10 \\\n"
             "    --tx-next-hop 192.0.2.1 \\\n"
+            "    --rx-src-ip 192.0.2.20 \\\n"
+            "    --rx-next-hop 192.0.2.2 \\\n"
             "    --traffic-dst-ip 198.51.100.10\n\n"
             "Stream example:\n"
             "  TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \\\n"
@@ -76,8 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
             "    --lab-id <lab-id> \\\n"
             "    --node-name <node-name> \\\n"
             "    --tx-port 0 \\\n"
+            "    --rx-port 1 \\\n"
             "    --tx-src-ip 192.0.2.10 \\\n"
             "    --tx-next-hop 192.0.2.1 \\\n"
+            "    --rx-src-ip 192.0.2.20 \\\n"
+            "    --rx-next-hop 192.0.2.2 \\\n"
             "    --traffic-dst-ip 198.51.100.10 \\\n"
             "    --rate 10kpps \\\n"
             "    --duration 10"
