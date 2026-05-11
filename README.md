@@ -856,7 +856,51 @@ Preferred:
 export TREXCMLLIB_PASSWORD='your-password'
 ```
 
-Or pass `password=` into `TrexConsoleConfig`.
+CLI alternatives:
+
+- use `--password '<ssh-password>'`
+- or use `--password-env SOME_ENV_VAR`
+
+Python alternatives:
+
+```python
+from trexcmllib import TrexConsoleConfig, TrexTraffic
+
+traffic = TrexTraffic(
+    TrexConsoleConfig(
+        jump_host="<cml-host>",
+        user="<ssh-user>",
+        password="<ssh-password>",
+        lab_name="<lab-name>",
+        node_name="<node-name>",
+        readonly=False,
+        force_acquire=True,
+    )
+)
+```
+
+You can also point `TrexConsoleConfig` at a different environment variable:
+
+```python
+from trexcmllib import TrexConsoleConfig
+
+cfg = TrexConsoleConfig(
+    jump_host="<cml-host>",
+    user="<ssh-user>",
+    password_env="MY_TREX_PASSWORD",
+    lab_name="<lab-name>",
+    node_name="<node-name>",
+)
+```
+
+Important:
+
+- the keyword is `password`, not `passwd`
+- resolution order is:
+  - explicit `password=...`
+  - `TrexConsoleConfig.password`
+  - environment variable from `password_env`
+  - interactive prompt
 
 ### Local Host Compatibility
 
