@@ -276,7 +276,23 @@ class PtySession:
         return self._returncode
 
     def send_bytes(self, data: bytes) -> None:
-        os.write(self._master_fd, data)
+        view = memoryview(data)
+        while view:
+            rc = self.poll()
+            if rc is not None:
+                raise SessionError(f"remote session exited early with code {rc}")
+            _, writable, _ = select.select([], [self._master_fd], [], 5.0)
+            if not writable:
+                continue
+            try:
+                written = os.write(self._master_fd, view[:4096])
+            except OSError as exc:
+                if exc.errno == errno.EIO:
+                    rc = self.poll()
+                    if rc is not None:
+                        raise SessionError(f"remote session exited early with code {rc}") from exc
+                raise SessionError(f"failed writing remote console: {exc}") from exc
+            view = view[written:]
 
     def send_line(self, text: str) -> None:
         self.send_bytes(text.encode("utf-8") + b"\n")
@@ -294,6 +310,18 @@ class PtySession:
             if exc.errno == errno.EIO:
                 return b""
             raise SessionError(f"failed reading remote console: {exc}") from exc
+
+    def drain_output(self) -> None:
+        while True:
+            chunk = self._read_once(0.0)
+            if not chunk:
+                rc = self.poll()
+                if rc is not None:
+                    raise SessionError(f"remote session exited early with code {rc}")
+                break
+            decoded = chunk.decode("utf-8", errors="ignore")
+            self._buffer += decoded
+            self._buffer = self._buffer[-20000:]
 
     def expect(
         self,
@@ -454,9 +482,13 @@ class TrexConsoleLauncher:
         try:
             self._ensure_server_running(session)
 
-            payload = "\n".join(commands).rstrip() + "\n"
             session.clear_buffer()
-            session.send_line(f"cat > {batch_file} <<'EOF'\n{payload}EOF")
+            session.send_line(f"cat > {batch_file} <<'EOF'")
+            session.drain_output()
+            for command in commands:
+                session.send_line(command)
+                session.drain_output()
+            session.send_line("EOF")
             session.expect([PROMPT_RE], timeout=cfg.command_timeout, echo=False)
 
             argv = ["trex_console", "-s", "127.0.0.1"]
