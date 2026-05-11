@@ -40,7 +40,10 @@ PROMPT_RE = re.compile(r"[^\n]*# ")
 TREX_PROMPT_RE = re.compile(r"trex(?:\(read-only\))?>")
 ACQUIRE_FAILED_RE = re.compile(r"Failed to acquire all required ports", re.IGNORECASE)
 BATCH_DONE_RE = re.compile(r"\[Done\]")
-BATCH_ERROR_RE = re.compile(r"\[FAILED\]|Traceback|error:", re.IGNORECASE)
+BATCH_ERROR_RE = re.compile(
+    r"\[FAILED\]|Traceback|error:|\*\*\* \[RPC\]|Failed to get server response|Shutting down RPC client",
+    re.IGNORECASE,
+)
 PASSWORD_RE = re.compile(r"password:", re.IGNORECASE)
 CONNECTED_RE = re.compile(r"Connected to CML terminalserver\.")
 TMUX_STATUS_RE = re.compile(r"\[trex\]")
@@ -488,12 +491,19 @@ class TrexConsoleLauncher:
             deadline = time.time() + timeout
             while time.time() < deadline:
                 chunk = session._read_once(1.0)
+                if not chunk:
+                    rc = session.poll()
+                    if rc is not None:
+                        break
+                    continue
                 if chunk:
                     session._buffer += chunk.decode("utf-8", errors="ignore")
                     session._buffer = session._buffer[-50000:]
                 if BATCH_DONE_RE.search(session._buffer):
                     break
-                if BATCH_ERROR_RE.search(session._buffer) and TREX_PROMPT_RE.search(session._buffer):
+                if BATCH_ERROR_RE.search(session._buffer) and (
+                    TREX_PROMPT_RE.search(session._buffer) or PROMPT_RE.search(session._buffer)
+                ):
                     break
 
             output = self._clean_output(session._buffer)

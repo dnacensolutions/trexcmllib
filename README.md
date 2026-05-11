@@ -368,6 +368,25 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
   --probe 0:192.0.2.10:192.0.2.1:192.0.2.1
 ```
 
+Default behavior:
+
+- prints per-port ping results
+- on failure, prints only the TRex CLI commands that were run for that probe
+- hides the full remote bootstrap and console log unless explicitly requested
+
+To include the full raw remote output for debugging:
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --count 3 \
+  --probe 0:192.0.2.10:192.0.2.1:192.0.2.1 \
+  --show-raw-output
+```
+
 To validate both links, repeat `--probe`:
 
 ```bash
@@ -482,6 +501,7 @@ For the `run_ping` example:
 - the next hop must answer ARP on that specific TRex link
 - the destination must answer ICMP through that same path
 - if a TRex port is connected only to a local loop or an otherwise empty switch segment, ping validation will fail at L3 resolution because there is no real remote endpoint
+- by default, failures show only the CLI commands that were executed; use `--show-raw-output` to print the full remote console session
 
 For the ASTF examples:
 

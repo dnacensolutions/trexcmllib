@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD", help="Environment variable used for the SSH password")
     parser.add_argument("--count", type=int, default=3, help="How many ICMP echo requests to send per probe (default: 3)")
     parser.add_argument("--pkt-size", type=int, default=64, help="ICMP packet size in bytes (default: 64)")
+    parser.add_argument("--show-raw-output", action="store_true", help="Show full remote console output on failure")
     parser.add_argument(
         "--probe",
         action="append",
@@ -84,6 +85,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ping probe definition. Repeat this option to test multiple links.",
     )
     return parser
+
+
+def build_probe_commands(probe: PingProbe, *, count: int, pkt_size: int) -> list[str]:
+    return [
+        f"service -p {probe.port}",
+        f"l3 -p {probe.port} --src {probe.src_ip} --dst {probe.next_hop_ip}",
+        f"ping -p {probe.port} -d {probe.dst_ip} -s {pkt_size} -n {count}",
+        f"service --off -p {probe.port}",
+        f"release -p {probe.port}",
+    ]
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -132,9 +145,14 @@ def main() -> int:
         return 0
 
     for probe, output in failures:
-        print(f"Full console output for port {probe.port}:\n")
-        print(output)
+        print(f"Commands run for port {probe.port}:")
+        for command in build_probe_commands(probe, count=args.count, pkt_size=args.pkt_size):
+            print(command)
         print()
+        if args.show_raw_output:
+            print(f"Full console output for port {probe.port}:\n")
+            print(output)
+            print()
 
     return 1
 
