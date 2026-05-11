@@ -34,6 +34,11 @@ Repository = "https://github.com/cisco-system-traffic-generator/trex-core"
 trexcmllib-open-console = "trexcmllib.examples.open_console:main"
 trexcmllib-l2-traffic = "trexcmllib.examples.run_l2_traffic:main"
 trexcmllib-l2-bidirectional = "trexcmllib.examples.run_l2_bidirectional:main"
+trexcmllib-l3-traffic = "trexcmllib.examples.run_l3_traffic:main"
+trexcmllib-l3-bidirectional = "trexcmllib.examples.run_l3_bidirectional:main"
+trexcmllib-ping = "trexcmllib.examples.run_ping:main"
+trexcmllib-astf-http = "trexcmllib.examples.run_astf_http:main"
+trexcmllib-astf-udp = "trexcmllib.examples.run_astf_udp:main"
 
 [tool.setuptools]
 include-package-data = false

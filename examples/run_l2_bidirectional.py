@@ -26,8 +26,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from trexcmllib import TrexConsoleConfig, TrexConsoleLauncher
-from trexcmllib.examples.common import discover_port_macs, parse_summary
+from trexcmllib import TrexConsoleConfig, TrexTraffic
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,129 +58,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_l2_bidirectional_batch(*, port_a: int, port_b: int, port_a_mac: str, port_b_mac: str, packets: int) -> list[str]:
-    if packets < 1:
-        raise ValueError("--packets must be at least 1")
-
-    commands = [
-        f"service -p {port_a} {port_b}",
-        f"l2 -p {port_a} --dst {port_b_mac}",
-        f"l2 -p {port_b} --dst {port_a_mac}",
-        f"service --off -p {port_a} {port_b}",
-        "clear",
-    ]
-
-    pkt_a = f"pkt -p {port_a} -s Ether(src='{port_a_mac}',dst='{port_b_mac}')/IP()/UDP()/('x'*10)"
-    pkt_b = f"pkt -p {port_b} -s Ether(src='{port_b_mac}',dst='{port_a_mac}')/IP()/UDP()/('x'*10)"
-    for _ in range(packets):
-        commands.append(pkt_a)
-        commands.append(pkt_b)
-
-    commands.extend(["stats", f"release -p {port_a} {port_b}"])
-    return commands
-
-
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    cfg = TrexConsoleConfig(
-        jump_host=args.jump_host,
-        user=args.user,
-        lab_name=args.lab_name,
-        node_name=args.node_name,
-        node_port=str(args.node_port),
-        password=args.password,
-        password_env=args.password_env,
-        readonly=False,
-        force_acquire=True,
+    traffic = TrexTraffic(
+        TrexConsoleConfig(
+            jump_host=args.jump_host,
+            user=args.user,
+            lab_name=args.lab_name,
+            node_name=args.node_name,
+            node_port=str(args.node_port),
+            password=args.password,
+            password_env=args.password_env,
+            readonly=False,
+            force_acquire=True,
+        )
     )
-    launcher = TrexConsoleLauncher(cfg)
-
-    port_a_mac = args.port_a_mac.lower() if args.port_a_mac else None
-    port_b_mac = args.port_b_mac.lower() if args.port_b_mac else None
-
-    if port_a_mac is None or port_b_mac is None:
-        port_macs = discover_port_macs(launcher)
-        try:
-            port_a_mac = port_a_mac or port_macs[args.port_a]["mac"]
-            port_b_mac = port_b_mac or port_macs[args.port_b]["mac"]
-        except KeyError as exc:
-            parser.error(
-                f"could not auto-discover MAC for port {exc.args[0]}; "
-                "pass --port-a-mac and --port-b-mac explicitly for this node"
-            )
-
-    result = launcher.run_console_batch(
-        build_l2_bidirectional_batch(
-            port_a=args.port_a,
-            port_b=args.port_b,
-            port_a_mac=port_a_mac,
-            port_b_mac=port_b_mac,
-            packets=args.packets,
-        ),
+    result = traffic.run(
+        "l2_bidirectional",
+        packets=args.packets,
+        port_a=args.port_a,
+        port_b=args.port_b,
+        port_a_mac=args.port_a_mac,
+        port_b_mac=args.port_b_mac,
         password=args.password,
-        ports=[args.port_a, args.port_b],
-        force_acquire=True,
-        readonly=False,
-        timeout=max(40.0, float(args.packets) * 3.0),
     )
-
-    metrics = parse_summary(result.output)
-
-    a_tx = metrics.get("opackets", {}).get(args.port_a, 0)
-    a_rx = metrics.get("ipackets", {}).get(args.port_a, 0)
-    b_tx = metrics.get("opackets", {}).get(args.port_b, 0)
-    b_rx = metrics.get("ipackets", {}).get(args.port_b, 0)
-    a_tx_bytes = metrics.get("obytes", {}).get(args.port_a, 0)
-    a_rx_bytes = metrics.get("ibytes", {}).get(args.port_a, 0)
-    b_tx_bytes = metrics.get("obytes", {}).get(args.port_b, 0)
-    b_rx_bytes = metrics.get("ibytes", {}).get(args.port_b, 0)
-    a_oerrors = metrics.get("oerrors", {}).get(args.port_a, 0)
-    a_ierrors = metrics.get("ierrors", {}).get(args.port_a, 0)
-    b_oerrors = metrics.get("oerrors", {}).get(args.port_b, 0)
-    b_ierrors = metrics.get("ierrors", {}).get(args.port_b, 0)
-
-    expected_total = args.packets * 2
-    sent_total = a_tx + b_tx
-    received_total = a_rx + b_rx
+    summary = result.summary
 
     print(f"CML host          : {args.jump_host}")
     print(f"Lab / node        : {args.lab_name} / {args.node_name}")
-    print(f"Ports             : a={args.port_a} b={args.port_b}")
-    print(f"Port MACs         : a={port_a_mac} b={port_b_mac}")
-    print(f"Packets per port  : {args.packets}")
-    print(f"Expected total tx : {expected_total}")
-    print(f"Expected total rx : {expected_total}")
-    print(f"Port {args.port_a} sent     : {a_tx}")
-    print(f"Port {args.port_a} received : {a_rx}")
-    print(f"Port {args.port_b} sent     : {b_tx}")
-    print(f"Port {args.port_b} received : {b_rx}")
-    print(f"Total sent        : {sent_total}")
-    print(f"Total received    : {received_total}")
-    print(f"Port {args.port_a} tx bytes : {a_tx_bytes}")
-    print(f"Port {args.port_a} rx bytes : {a_rx_bytes}")
-    print(f"Port {args.port_b} tx bytes : {b_tx_bytes}")
-    print(f"Port {args.port_b} rx bytes : {b_rx_bytes}")
-    print(f"Port {args.port_a} errors   : tx={a_oerrors} rx={a_ierrors}")
-    print(f"Port {args.port_b} errors   : tx={b_oerrors} rx={b_ierrors}")
-    print(f"Batch success     : {'yes' if result.success else 'no'}")
+    print(f"Ports             : a={summary['port_a']} b={summary['port_b']}")
+    print(f"Port MACs         : a={summary['port_a_mac']} b={summary['port_b_mac']}")
+    print(f"Packets per port  : {summary['packets_per_port']}")
+    print(f"Expected total tx : {summary['expected_total']}")
+    print(f"Expected total rx : {summary['expected_total']}")
+    print(f"Port {summary['port_a']} sent     : {summary['port_a_sent']}")
+    print(f"Port {summary['port_a']} received : {summary['port_a_received']}")
+    print(f"Port {summary['port_b']} sent     : {summary['port_b_sent']}")
+    print(f"Port {summary['port_b']} received : {summary['port_b_received']}")
+    print(f"Loss {summary['port_a']}->{summary['port_b']}     : {summary['loss_a_to_b']} ({summary['loss_a_to_b_pct']:.2f}%)")
+    print(f"Loss {summary['port_b']}->{summary['port_a']}     : {summary['loss_b_to_a']} ({summary['loss_b_to_a_pct']:.2f}%)")
+    print(f"Total sent        : {summary['total_sent']}")
+    print(f"Total received    : {summary['total_received']}")
+    print(f"Total loss        : {summary['total_loss']} ({summary['total_loss_pct']:.2f}%)")
+    print(f"Port {summary['port_a']} tx bytes : {summary['port_a_tx_bytes']}")
+    print(f"Port {summary['port_a']} rx bytes : {summary['port_a_rx_bytes']}")
+    print(f"Port {summary['port_b']} tx bytes : {summary['port_b_tx_bytes']}")
+    print(f"Port {summary['port_b']} rx bytes : {summary['port_b_rx_bytes']}")
+    print(f"Port {summary['port_a']} errors   : tx={summary['port_a_tx_errors']} rx={summary['port_a_rx_errors']}")
+    print(f"Port {summary['port_b']} errors   : tx={summary['port_b_tx_errors']} rx={summary['port_b_rx_errors']}")
+    print(f"Batch success     : {'yes' if summary['batch_success'] else 'no'}")
 
-    if (
-        result.success
-        and a_tx == args.packets
-        and a_rx == args.packets
-        and b_tx == args.packets
-        and b_rx == args.packets
-        and a_oerrors == 0
-        and a_ierrors == 0
-        and b_oerrors == 0
-        and b_ierrors == 0
-    ):
+    if result.success:
         return 0
 
     print("\nFull console output:\n")
-    print(result.output)
+    print(result.outputs["traffic"])
     return 1
 
 

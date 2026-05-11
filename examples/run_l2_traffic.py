@@ -26,8 +26,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from trexcmllib import TrexConsoleConfig, TrexConsoleLauncher
-from trexcmllib.examples.common import discover_port_macs, parse_summary
+from trexcmllib import TrexConsoleConfig, TrexTraffic
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,95 +58,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_l2_batch(*, tx_port: int, rx_port: int, tx_mac: str, rx_mac: str, packets: int) -> list[str]:
-    if packets < 1:
-        raise ValueError("--packets must be at least 1")
-
-    commands = [
-        f"service -p {tx_port} {rx_port}",
-        f"l2 -p {tx_port} --dst {rx_mac}",
-        f"l2 -p {rx_port} --dst {tx_mac}",
-        f"service --off -p {tx_port} {rx_port}",
-        "clear",
-    ]
-    packet_cmd = f"pkt -p {tx_port} -s Ether(src='{tx_mac}',dst='{rx_mac}')/IP()/UDP()/('x'*10)"
-    commands.extend([packet_cmd] * packets)
-    commands.extend(["stats", f"release -p {tx_port} {rx_port}"])
-    return commands
-
-
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    cfg = TrexConsoleConfig(
-        jump_host=args.jump_host,
-        user=args.user,
-        lab_name=args.lab_name,
-        node_name=args.node_name,
-        node_port=str(args.node_port),
-        password=args.password,
-        password_env=args.password_env,
-        readonly=False,
-        force_acquire=True,
+    traffic = TrexTraffic(
+        TrexConsoleConfig(
+            jump_host=args.jump_host,
+            user=args.user,
+            lab_name=args.lab_name,
+            node_name=args.node_name,
+            node_port=str(args.node_port),
+            password=args.password,
+            password_env=args.password_env,
+            readonly=False,
+            force_acquire=True,
+        )
     )
-    launcher = TrexConsoleLauncher(cfg)
-
-    tx_mac = args.tx_mac.lower() if args.tx_mac else None
-    rx_mac = args.rx_mac.lower() if args.rx_mac else None
-
-    if tx_mac is None or rx_mac is None:
-        port_macs = discover_port_macs(launcher)
-        try:
-            tx_mac = tx_mac or port_macs[args.tx_port]["mac"]
-            rx_mac = rx_mac or port_macs[args.rx_port]["mac"]
-        except KeyError as exc:
-            parser.error(
-                f"could not auto-discover MAC for port {exc.args[0]}; "
-                "pass --tx-mac and --rx-mac explicitly for this node"
-            )
-
-    result = launcher.run_console_batch(
-        build_l2_batch(
-            tx_port=args.tx_port,
-            rx_port=args.rx_port,
-            tx_mac=tx_mac,
-            rx_mac=rx_mac,
-            packets=args.packets,
-        ),
+    result = traffic.run(
+        "l2",
+        packets=args.packets,
+        tx_port=args.tx_port,
+        rx_port=args.rx_port,
+        tx_mac=args.tx_mac,
+        rx_mac=args.rx_mac,
         password=args.password,
-        ports=[args.tx_port, args.rx_port],
-        force_acquire=True,
-        readonly=False,
-        timeout=max(40.0, float(args.packets) * 1.5),
     )
-
-    metrics = parse_summary(result.output)
-    tx_packets = metrics.get("opackets", {}).get(args.tx_port, 0)
-    rx_packets = metrics.get("ipackets", {}).get(args.rx_port, 0)
-    tx_bytes = metrics.get("obytes", {}).get(args.tx_port, 0)
-    rx_bytes = metrics.get("ibytes", {}).get(args.rx_port, 0)
-    tx_errors = metrics.get("oerrors", {}).get(args.tx_port, 0)
-    rx_errors = metrics.get("ierrors", {}).get(args.rx_port, 0)
+    summary = result.summary
 
     print(f"CML host        : {args.jump_host}")
     print(f"Lab / node      : {args.lab_name} / {args.node_name}")
-    print(f"Ports           : tx={args.tx_port} rx={args.rx_port}")
-    print(f"Port MACs       : tx={tx_mac} rx={rx_mac}")
-    print(f"Packets asked   : {args.packets}")
-    print(f"Packets sent    : {tx_packets}")
-    print(f"Packets received: {rx_packets}")
-    print(f"Bytes sent      : {tx_bytes}")
-    print(f"Bytes received  : {rx_bytes}")
-    print(f"Tx errors       : {tx_errors}")
-    print(f"Rx errors       : {rx_errors}")
-    print(f"Batch success   : {'yes' if result.success else 'no'}")
+    print(f"Ports           : tx={summary['tx_port']} rx={summary['rx_port']}")
+    print(f"Port MACs       : tx={summary['tx_mac']} rx={summary['rx_mac']}")
+    print(f"Packets asked   : {summary['packets_asked']}")
+    print(f"Packets sent    : {summary['packets_sent']}")
+    print(f"Packets received: {summary['packets_received']}")
+    print(f"Packet loss     : {summary['packet_loss']} ({summary['packet_loss_pct']:.2f}%)")
+    print(f"Bytes sent      : {summary['bytes_sent']}")
+    print(f"Bytes received  : {summary['bytes_received']}")
+    print(f"Tx errors       : {summary['tx_errors']}")
+    print(f"Rx errors       : {summary['rx_errors']}")
+    print(f"Batch success   : {'yes' if summary['batch_success'] else 'no'}")
 
-    if result.success and tx_packets == args.packets and rx_packets == args.packets and tx_errors == 0 and rx_errors == 0:
+    if result.success:
         return 0
 
     print("\nFull console output:\n")
-    print(result.output)
+    print(result.outputs["traffic"])
     return 1
 
 

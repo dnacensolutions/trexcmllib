@@ -4,14 +4,16 @@
 How to use:
 1. Export the SSH password in ``TREXCMLLIB_PASSWORD`` or pass ``--password``.
 2. Provide the CML host, SSH user, lab name, and node name explicitly.
-3. Run the script directly or as a module.
+3. Optionally choose `--server-mode astf` when you want an ASTF-capable TRex console.
+4. Run the script directly or as a module.
 
 Example CLI:
     TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.open_console \
       --cml-host <cml-host> \
       --user <ssh-user> \
       --lab-name <lab-name> \
-      --node-name <node-name>
+      --node-name <node-name> \
+      --server-mode stl
 """
 
 from __future__ import annotations
@@ -37,7 +39,8 @@ def parse_args() -> argparse.Namespace:
             "    --cml-host <cml-host> \\\n"
             "    --user <ssh-user> \\\n"
             "    --lab-name <lab-name> \\\n"
-            "    --node-name <node-name>"
+            "    --node-name <node-name> \\\n"
+            "    --server-mode stl"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -50,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--console-path")
     parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD")
     parser.add_argument("--password")
+    parser.add_argument("--server-mode", choices=("stl", "astf"), default="stl")
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--command-timeout", type=float, default=20.0)
     parser.add_argument("--console-timeout", type=float, default=40.0)
@@ -73,6 +77,7 @@ def main() -> int:
             console_path=args.console_path,
             password_env=args.password_env,
             password=args.password,
+            server_mode=args.server_mode,
             connect_timeout=args.connect_timeout,
             command_timeout=args.command_timeout,
             console_timeout=args.console_timeout,

@@ -12,16 +12,31 @@ Dependency summary:
 - On macOS, direct STL imports may still fail because the bundled TRex client
   dependencies include Linux-oriented payloads such as ``pyzmq-ctypes``.
   In that case prefer console-batch automation through ``TrexConsoleLauncher``.
+- ASTF/stateful helpers in ``TrexAstfConsoleRunner`` also use the console-batch
+  path and require the remote TRex server to be started in ASTF mode.
+- ``TrexTraffic`` provides a single high-level API over the console launcher for
+  the bundled L2, L3, ping, and ASTF workflows used by the example scripts.
 """
 
+from .astf import TrexAstfConsoleRunner, TrexAstfProfileRunResult, parse_astf_numeric_stats
 from .console import SessionError, TrexConsoleBatchResult, TrexConsoleConfig, TrexConsoleLauncher
 from .stl import TrexCmlLib, configure_trex_python_path
+from .traffic import PingProbe, TrexTraffic, TrexTrafficResult, loss_count, loss_percent, parse_probe
 
 __all__ = [
+    "PingProbe",
     "SessionError",
+    "TrexAstfConsoleRunner",
+    "TrexAstfProfileRunResult",
     "TrexConsoleBatchResult",
     "TrexCmlLib",
     "TrexConsoleConfig",
     "TrexConsoleLauncher",
+    "TrexTraffic",
+    "TrexTrafficResult",
     "configure_trex_python_path",
+    "loss_count",
+    "parse_astf_numeric_stats",
+    "parse_probe",
+    "loss_percent",
 ]

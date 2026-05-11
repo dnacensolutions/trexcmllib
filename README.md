@@ -6,6 +6,8 @@ It has two complementary layers:
 
 - `TrexConsoleLauncher`: open a remote TRex node through a CML terminal server, start the TRex server if needed, and run console CLI batches reliably.
 - `TrexCmlLib`: a thin wrapper around the bundled TRex STL Python client for simple port, traffic, stats, and ping workflows.
+- `TrexAstfConsoleRunner`: a console-driven ASTF helper for stateful L3 and application traffic profiles.
+- `TrexTraffic`: a single high-level class that wraps `TrexConsoleLauncher` and `TrexAstfConsoleRunner` and powers the bundled traffic examples.
 
 This library was built to solve practical lab tasks:
 
@@ -14,6 +16,7 @@ This library was built to solve practical lab tasks:
 - configure L2 or L3 port state
 - send simple L2 or L3 traffic
 - read counters and summarize pass/fail results
+- report packet-loss counts and percentages in the bundled examples
 - package sample scripts so other tools can reuse them
 
 ## Status
@@ -72,6 +75,7 @@ trexcmllib/
   __init__.py
   console.py
   stl.py
+  traffic.py
   README.md
   examples/
     __init__.py
@@ -79,6 +83,11 @@ trexcmllib/
     open_console.py
     run_l2_traffic.py
     run_l2_bidirectional.py
+    run_l3_traffic.py
+    run_l3_bidirectional.py
+    run_ping.py
+    run_astf_http.py
+    run_astf_udp.py
 ```
 
 ## Main API
@@ -132,6 +141,48 @@ Useful methods:
 - `clear_stats()`
 - `stop_traffic()`
 
+### `TrexAstfConsoleRunner`
+
+Console-driven ASTF helper for advanced stateful traffic.
+
+Useful methods:
+
+- `run_profile()`
+- `build_start_command()`
+- `build_stats_command()`
+- `build_stop_command()`
+- `validate_metrics()`
+
+### `TrexTraffic`
+
+Unified console-driven traffic API for the bundled examples.
+
+Useful methods:
+
+- `run("l2", ...)`
+- `run("l2_bidirectional", ...)`
+- `run("l3", ...)`
+- `run("l3_bidirectional", ...)`
+- `run("ping", ...)`
+- `run("astf_http", ...)`
+- `run("astf_udp", ...)`
+
+Each call returns a `TrexTrafficResult` with:
+
+- `success`
+- `summary`
+- `metrics`
+- `outputs`
+
+The example scripts under `trexcmllib.examples` are now thin CLI wrappers over `TrexTraffic`.
+
+Important ASTF requirement:
+
+- the remote TRex server must run in ASTF mode, for example `-i --astf`
+- unlike STL, ASTF traffic normally depends on routed client/server profile IP ranges between TRex ports
+- ASTF UDP examples report packet loss using `udps_sndpkt` versus `udps_rcvpkt`
+- ASTF TCP examples report data-packet loss using `tcps_sndpack` versus `tcps_rcvpack`, plus retransmit and drop counters
+
 ## Example: Open a Console
 
 ```python
@@ -184,6 +235,34 @@ print(result.success)
 print(result.output)
 ```
 
+## Example: Run Traffic Through One API
+
+```python
+from trexcmllib import TrexConsoleConfig, TrexTraffic
+
+traffic = TrexTraffic(
+    TrexConsoleConfig(
+        jump_host="<cml-host>",
+        user="<ssh-user>",
+        lab_name="<lab-name>",
+        node_name="<node-name>",
+        readonly=False,
+        force_acquire=True,
+    )
+)
+
+result = traffic.run(
+    "l2",
+    packets=10,
+    tx_port=0,
+    rx_port=1,
+)
+
+print(result.success)
+print(result.summary["packet_loss"])
+print(result.outputs["traffic"])
+```
+
 ## Example Scripts
 
 These examples can be run as modules when `scripts/` is on `PYTHONPATH`, or directly from the repo checkout.
@@ -220,6 +299,87 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_bidir
   --packets 10
 ```
 
+### L3 Traffic
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --packets 10 \
+  --tx-port 0 \
+  --tx-src-ip 192.0.2.10 \
+  --tx-next-hop 192.0.2.1 \
+  --traffic-dst-ip 198.51.100.10
+```
+
+### Bidirectional L3 Traffic
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_bidirectional \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --packets 10 \
+  --port-a-src-ip 192.0.2.10 \
+  --port-b-src-ip 192.0.2.20 \
+  --port-a-next-hop-ip 192.0.2.1 \
+  --port-b-next-hop-ip 192.0.2.2 \
+  --traffic-a-dst-ip 198.51.100.10 \
+  --traffic-b-dst-ip 198.51.100.20
+```
+
+### Ping Validation
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --count 3 \
+  --probe 0:192.0.2.10:192.0.2.1:192.0.2.1
+```
+
+To validate both links, repeat `--probe`:
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --count 3 \
+  --probe 0:192.0.2.10:192.0.2.1:192.0.2.1 \
+  --probe 1:198.51.100.10:198.51.100.1:198.51.100.1
+```
+
+### ASTF HTTP Application Traffic
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_astf_http \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --duration 10 \
+  --multiplier 100
+```
+
+### ASTF UDP Stateful Traffic
+
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_astf_udp \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-name <lab-name> \
+  --node-name <node-name> \
+  --duration 10 \
+  --multiplier 100
+```
+
 ### Installed Console Scripts
 
 If the package is installed, the same examples are exposed as console scripts:
@@ -228,6 +388,11 @@ If the package is installed, the same examples are exposed as console scripts:
 trexcmllib-open-console
 trexcmllib-l2-traffic
 trexcmllib-l2-bidirectional
+trexcmllib-l3-traffic
+trexcmllib-l3-bidirectional
+trexcmllib-ping
+trexcmllib-astf-http
+trexcmllib-astf-udp
 ```
 
 ## Environment Notes
@@ -273,6 +438,33 @@ Namespace-backed L3 workflows require:
 - `ethtool`
 
 If those are missing, L2 CLI traffic can still work while namespace/L3 automation fails.
+
+For the `run_l3_traffic` example specifically:
+
+- the transmit port next hop must answer ARP
+- the chosen traffic destination must make sense for your topology
+- if you provide an `--rx-port`, any receive-side counters depend on an actual return or forwarding path in the lab
+
+For the `run_l3_bidirectional` example:
+
+- you can use ARP mode with `--port-a-next-hop-ip` and `--port-b-next-hop-ip`
+- or use explicit MAC mode with `--port-a-next-hop-mac` and `--port-b-next-hop-mac`
+- explicit MAC mode is useful for loopback or lab validation when you want IP traffic counters without depending on ARP
+
+For the `run_ping` example:
+
+- each `--probe` is `PORT:SRC_IP:NEXT_HOP_IP:DST_IP`
+- the next hop must answer ARP on that specific TRex link
+- the destination must answer ICMP through that same path
+- if a TRex port is connected only to a local loop or an otherwise empty switch segment, ping validation will fail at L3 resolution because there is no real remote endpoint
+
+For the ASTF examples:
+
+- the remote TRex server must be started in ASTF mode, not STL mode
+- the client and server IP ranges embedded in the ASTF profile must be routable between the participating TRex ports
+- `run_astf_http.py` defaults to `astf/http_simple.py`
+- `run_astf_udp.py` defaults to `astf/udp_pcap.py`
+- these examples validate stateful counters such as `tcps_connects` or `udps_connects` and byte symmetry between client and server
 
 ## Recommended Next Steps Before Publishing
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import errno
 import getpass
+import json
 import os
 import pty
 import re
@@ -48,19 +49,6 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\([A-Za-z0-9]|\x0f|\r")
 SERVER_WINDOW = "codex-trex-server"
 CONSOLE_WINDOW = "codex-trex-console"
 
-SERVER_START_CMD = (
-    "if ps -ef | grep -F '/trex/_t-rex-64-o -i --no-scapy-server' | "
-    "grep -v grep >/dev/null; then "
-    "echo '__TREX_SERVER_ALREADY_RUNNING__'; "
-    "else "
-    f"tmux kill-window -t {SERVER_WINDOW} 2>/dev/null || true; "
-    f"tmux new-window -d -n {SERVER_WINDOW} "
-    "'export LD_LIBRARY_PATH=/trex/so:/trex/so/x86_64:$LD_LIBRARY_PATH; "
-    "cd /trex; "
-    "./_t-rex-64-o -i --no-scapy-server'; "
-    "fi"
-)
-
 CONSOLE_PYTHON = (
     'import sys,types,shutil,runpy; '
     'dist=types.ModuleType("distutils"); '
@@ -88,6 +76,9 @@ class TrexConsoleConfig:
     command_timeout: float = 20.0
     console_timeout: float = 40.0
     server_wait: float = 4.0
+    server_mode: str = "stl"
+    server_args: tuple[str, ...] | None = None
+    server_workdir: str | None = None
     readonly: bool = True
     force_acquire: bool = False
     exit_after_prompt: bool = False
@@ -106,6 +97,118 @@ class TrexConsoleBatchResult:
     success: bool
     output: str
     batch_file: str
+
+
+def _default_server_args(server_mode: str) -> list[str]:
+    mode = server_mode.lower()
+    if mode == "stl":
+        return ["-i"]
+    if mode == "astf":
+        return ["-i", "--astf"]
+    raise SessionError(f"unsupported TRex server mode: {server_mode}")
+
+
+def _build_server_start_cmd(config: TrexConsoleConfig) -> str:
+    explicit_server_args = list(config.server_args) if config.server_args is not None else None
+    default_server_args = _default_server_args(config.server_mode)
+    python_script = f"""
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import time
+
+SERVER_WINDOW = {SERVER_WINDOW!r}
+server_mode = {config.server_mode!r}
+explicit_args = json.loads({json.dumps(json.dumps(explicit_server_args))})
+default_args = json.loads({json.dumps(json.dumps(default_server_args))})
+explicit_workdir = {config.server_workdir!r}
+binary = os.path.realpath('/trex/_t-rex-64-o')
+ld_path = '/trex/so:/trex/so/x86_64:' + os.environ.get('LD_LIBRARY_PATH', '')
+mode_flags = {{'--astf', '--no-scapy-server'}}
+
+def resolve_workdir():
+    if server_mode != 'astf':
+        return '/trex'
+    if explicit_workdir:
+        return explicit_workdir
+    roots = []
+    for root in ('/trex', os.path.realpath('/trex')):
+        if root and root not in roots and os.path.isdir(root):
+            roots.append(root)
+    for root in roots:
+        for current_root, _, files in os.walk(root):
+            if 'astf_schema.json' in files:
+                return current_root
+    return '/trex'
+
+workdir = resolve_workdir()
+
+def current_server():
+    out = subprocess.run(['ps', '-ef'], capture_output=True, text=True, check=True).stdout.splitlines()
+    pattern = re.compile(r'(?:(?:--\\s+)?)(?P<binary>/\\S*_t-rex-64-o)\\s*(?P<args>.*)$')
+    for line in out:
+        if '_t-rex-64-o' not in line or 'grep' in line:
+            continue
+        match = pattern.search(line)
+        if not match:
+            continue
+        parts = line.split(None, 2)
+        pid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        args = shlex.split(match.group('args'))
+        return pid, os.path.realpath(match.group('binary')), args
+    return None, None, None
+
+def build_desired_args(current_args):
+    if explicit_args is not None:
+        return explicit_args
+    if current_args:
+        desired = [arg for arg in current_args if arg not in mode_flags]
+        if '-i' not in desired:
+            desired.insert(0, '-i')
+    else:
+        desired = list(default_args)
+    if server_mode == 'astf':
+        if '--astf' not in desired:
+            desired.append('--astf')
+    return desired
+
+pid, current_binary, current_args = current_server()
+desired_args = build_desired_args(current_args)
+
+if pid and current_binary == binary and current_args == desired_args:
+    print('__TREX_SERVER_ALREADY_RUNNING__')
+    raise SystemExit(0)
+
+if pid:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid = None
+    else:
+        for _ in range(20):
+            time.sleep(0.25)
+            if not os.path.exists(f'/proc/{{pid}}'):
+                break
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(1.0)
+
+subprocess.run(['tmux', 'kill-window', '-t', SERVER_WINDOW], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+launch_inner = (
+    f'export LD_LIBRARY_PATH={{shlex.quote(ld_path)}}; '
+    f'cd {{shlex.quote(workdir)}}; '
+    + 'exec '
+    + shlex.join([binary, *desired_args])
+)
+subprocess.run(['tmux', 'new-window', '-d', '-n', SERVER_WINDOW, launch_inner], check=True)
+"""
+    return "python3 - <<'PY'\n" + python_script.strip() + "\nPY"
 
 
 def build_console_start_cmd(*, readonly: bool = False, force_acquire: bool = False) -> str:
@@ -298,9 +401,16 @@ class TrexConsoleLauncher:
 
     def _ensure_server_running(self, session: PtySession) -> None:
         cfg = self.config
-        session.send_line(SERVER_START_CMD)
+        session.send_line(_build_server_start_cmd(cfg))
         session.expect([PROMPT_RE], timeout=cfg.command_timeout, echo=False)
         time.sleep(cfg.server_wait)
+
+    def ensure_server_running(self, *, password: str | None = None) -> None:
+        session = self._open_shell_session(password=password)
+        try:
+            self._ensure_server_running(session)
+        finally:
+            session.close()
 
     @staticmethod
     def _clean_output(text: str) -> str:
@@ -311,13 +421,15 @@ class TrexConsoleLauncher:
         commands: Sequence[str],
         *,
         password: str | None = None,
+        timeout: float | None = None,
     ) -> str:
         session = self._open_shell_session(password=password)
+        wait_timeout = timeout or self.config.command_timeout
         try:
             session.clear_buffer()
             for command in commands:
                 session.send_line(command)
-                session.expect([PROMPT_RE], timeout=self.config.command_timeout, echo=False)
+                session.expect([PROMPT_RE], timeout=wait_timeout, echo=False)
             return self._clean_output(session._buffer)
         finally:
             session.close()
