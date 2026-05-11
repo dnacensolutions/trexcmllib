@@ -41,6 +41,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from trexcmllib import PingProbe, TrexConsoleConfig, TrexTraffic, parse_probe
+from trexcmllib.examples.common import add_console_target_args, add_traffic_reset_args, console_target_kwargs, validate_console_target_args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,13 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--cml-host", "--jump-host", dest="jump_host", required=True, help="CML terminal server hostname or IP")
-    parser.add_argument("--lab-name", required=True, help="CML lab name")
-    parser.add_argument("--node-name", required=True, help="TRex node name in the lab")
-    parser.add_argument("--node-port", default="0", help="CML console line index (default: 0)")
-    parser.add_argument("--user", required=True, help="SSH username for the CML host")
-    parser.add_argument("--password", default=None, help="SSH password for the CML host")
-    parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD", help="Environment variable used for the SSH password")
+    add_console_target_args(parser)
+    add_traffic_reset_args(parser)
     parser.add_argument("--count", type=int, default=3, help="How many ICMP echo requests to send per probe (default: 3)")
     parser.add_argument("--pkt-size", type=int, default=64, help="ICMP packet size in bytes (default: 64)")
     parser.add_argument("--show-raw-output", action="store_true", help="Show full remote console output on failure")
@@ -100,6 +96,7 @@ def build_probe_commands(probe: PingProbe, *, count: int, pkt_size: int) -> list
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    validate_console_target_args(parser, args)
 
     probes: list[PingProbe] = []
     for probe_text in args.probe:
@@ -110,16 +107,11 @@ def main() -> int:
 
     traffic = TrexTraffic(
         TrexConsoleConfig(
-            jump_host=args.jump_host,
-            user=args.user,
-            lab_name=args.lab_name,
-            node_name=args.node_name,
-            node_port=str(args.node_port),
-            password=args.password,
-            password_env=args.password_env,
+            **console_target_kwargs(args),
             readonly=False,
             force_acquire=True,
-        )
+        ),
+        hard_reset=args.hard_reset,
     )
     result = traffic.run("ping", probes=probes, count=args.count, pkt_size=args.pkt_size, password=args.password)
 

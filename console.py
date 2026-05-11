@@ -26,10 +26,13 @@ import pty
 import re
 import select
 import shlex
+import ssl
 import sys
 import termios
 import time
 import tty
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -37,7 +40,10 @@ from dataclasses import dataclass
 TMUX_PREFIX = b"\x02"  # Ctrl-b
 DETACH_ESCAPE = b"\x1d"  # Ctrl-]
 PROMPT_RE = re.compile(r"[^\n]*# ")
-TREX_PROMPT_RE = re.compile(r"trex(?:\(read-only\))?>")
+# Keep TRex prompt detection permissive. The committed batch path worked with a
+# loose matcher, and the newer interactive settle path emits prompts mixed with
+# tmux/status noise where strict line anchoring is brittle.
+TREX_PROMPT_RE = re.compile(r"trex(?:\s*\([^)]*\))?>")
 ACQUIRE_FAILED_RE = re.compile(r"Failed to acquire all required ports", re.IGNORECASE)
 BATCH_DONE_RE = re.compile(r"\[Done\]")
 BATCH_ERROR_RE = re.compile(
@@ -71,6 +77,8 @@ class TrexConsoleConfig:
     user: str = ""
     lab_name: str = ""
     node_name: str = ""
+    lab_id: str = ""
+    node_id: str = ""
     node_port: str = "0"
     console_path: str | None = None
     password_env: str = "TREXCMLLIB_PASSWORD"
@@ -79,20 +87,22 @@ class TrexConsoleConfig:
     command_timeout: float = 20.0
     console_timeout: float = 40.0
     server_wait: float = 4.0
+    acquire_settle_time: float = 2.0
     server_mode: str = "stl"
     server_args: tuple[str, ...] | None = None
     server_workdir: str | None = None
     readonly: bool = True
     force_acquire: bool = False
     exit_after_prompt: bool = False
+    api_verify_tls: bool = False
+    hard_reset: bool = False
 
     def build_console_path(self) -> str:
         if self.console_path:
             return self.console_path
-        missing = [name for name, value in (("lab_name", self.lab_name), ("node_name", self.node_name)) if not value]
-        if missing:
-            raise SessionError(f"missing required console path fields: {', '.join(missing)}")
-        return f"/{self.lab_name}/{self.node_name}/{self.node_port}"
+        if self.lab_id and self.node_id:
+            return f"/{self.lab_id}/{self.node_id}/{self.node_port}"
+        raise SessionError("console path requires ids; resolve names first or provide console_path directly")
 
 
 @dataclass(slots=True)
@@ -125,6 +135,7 @@ import time
 
 SERVER_WINDOW = {SERVER_WINDOW!r}
 server_mode = {config.server_mode!r}
+force_restart = {config.hard_reset!r}
 explicit_args = json.loads({json.dumps(json.dumps(explicit_server_args))})
 default_args = json.loads({json.dumps(json.dumps(default_server_args))})
 explicit_workdir = {config.server_workdir!r}
@@ -181,7 +192,7 @@ def build_desired_args(current_args):
 pid, current_binary, current_args = current_server()
 desired_args = build_desired_args(current_args)
 
-if pid and current_binary == binary and current_args == desired_args:
+if not force_restart and pid and current_binary == binary and current_args == desired_args:
     print('__TREX_SERVER_ALREADY_RUNNING__')
     raise SystemExit(0)
 
@@ -320,7 +331,7 @@ class PtySession:
                     raise SessionError(f"remote session exited early with code {rc}")
                 break
             decoded = chunk.decode("utf-8", errors="ignore")
-            self._buffer += decoded
+            self._buffer += ANSI_RE.sub("", decoded)
             self._buffer = self._buffer[-20000:]
 
     def expect(
@@ -344,7 +355,7 @@ class PtySession:
                 os.write(sys.stdout.fileno(), chunk)
 
             decoded = chunk.decode("utf-8", errors="ignore")
-            self._buffer += decoded
+            self._buffer += ANSI_RE.sub("", decoded)
             self._buffer = self._buffer[-20000:]
 
             for idx, pattern in enumerate(patterns):
@@ -388,6 +399,8 @@ class TrexConsoleLauncher:
 
     def __init__(self, config: TrexConsoleConfig) -> None:
         self.config = config
+        self._server_ready_for_run = False
+        self._needs_acquire_settle = False
 
     def get_password(self, password: str | None = None) -> str:
         if password:
@@ -402,13 +415,134 @@ class TrexConsoleLauncher:
         prompt = f"Password for {self.config.user}@{self.config.jump_host}: "
         return getpass.getpass(prompt)
 
+    def _ssl_context(self) -> ssl.SSLContext | None:
+        if self.config.api_verify_tls:
+            return None
+        return ssl._create_unverified_context()
+
+    def _cml_api_request(
+        self,
+        path: str,
+        *,
+        token: str | None = None,
+        method: str = "GET",
+        payload: dict[str, object] | None = None,
+        password: str | None = None,
+    ) -> object:
+        url = f"https://{self.config.jump_host}{path}"
+        last_error: Exception | None = None
+        for attempt in range(3):
+            headers: dict[str, str] = {}
+            data: bytes | None = None
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            if payload is not None:
+                headers["Content-Type"] = "application/json"
+                data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req, context=self._ssl_context(), timeout=self.config.command_timeout) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")
+                raise SessionError(f"CML API request failed for {path}: HTTP {exc.code} {body[:200]}") from exc
+            except urllib.error.URLError as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise SessionError(f"CML API request failed for {path}: {exc.reason}") from exc
+                time.sleep(0.5 * (attempt + 1))
+        else:
+            if last_error is not None:
+                raise SessionError(f"CML API request failed for {path}: {last_error}") from last_error
+            raise SessionError(f"CML API request failed for {path}")
+
+        if not body:
+            return None
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            return body
+
+    def _cml_api_token(self, password: str | None = None) -> str:
+        response = self._cml_api_request(
+            "/api/v0/auth_extended",
+            method="POST",
+            payload={"username": self.config.user, "password": self.get_password(password)},
+        )
+        if not isinstance(response, dict) or not response.get("token"):
+            raise SessionError("failed to obtain CML API token")
+        return str(response["token"])
+
+    def _resolve_lab_id_via_api(self, token: str) -> str:
+        cfg = self.config
+        if cfg.lab_id:
+            return cfg.lab_id
+        if not cfg.lab_name:
+            raise SessionError("provide lab_id or lab_name")
+
+        labs = self._cml_api_request("/api/v0/labs", token=token)
+        if not isinstance(labs, list):
+            raise SessionError("unexpected response while listing CML labs")
+
+        matches: list[str] = []
+        for lab_id in labs:
+            lab = self._cml_api_request(f"/api/v0/labs/{lab_id}", token=token)
+            if isinstance(lab, dict) and lab.get("lab_title") == cfg.lab_name:
+                matches.append(str(lab_id))
+        if not matches:
+            raise SessionError(f"could not find CML lab named {cfg.lab_name!r}")
+        if len(matches) > 1:
+            raise SessionError(f"found multiple CML labs named {cfg.lab_name!r}; use lab_id instead")
+        return matches[0]
+
+    def _resolve_node_id_via_api(self, lab_id: str, token: str) -> str:
+        cfg = self.config
+        if cfg.node_id:
+            return cfg.node_id
+        if not cfg.node_name:
+            raise SessionError("provide node_id or node_name")
+
+        nodes = self._cml_api_request(f"/api/v0/labs/{lab_id}/nodes", token=token)
+        if not isinstance(nodes, list):
+            raise SessionError("unexpected response while listing CML nodes")
+
+        matches: list[str] = []
+        for node_id in nodes:
+            node = self._cml_api_request(f"/api/v0/labs/{lab_id}/nodes/{node_id}", token=token)
+            if isinstance(node, dict) and node.get("label") == cfg.node_name:
+                matches.append(str(node_id))
+        if not matches:
+            raise SessionError(f"could not find node named {cfg.node_name!r} in lab {lab_id}")
+        if len(matches) > 1:
+            raise SessionError(f"found multiple nodes named {cfg.node_name!r} in lab {lab_id}; use node_id instead")
+        return matches[0]
+
+    def _resolve_console_path(self, *, password: str | None = None) -> str:
+        cfg = self.config
+        if cfg.console_path:
+            return cfg.console_path
+        if cfg.lab_id and cfg.node_id:
+            return f"/{cfg.lab_id}/{cfg.node_id}/{cfg.node_port}"
+
+        has_lab_selector = bool(cfg.lab_id or cfg.lab_name)
+        has_node_selector = bool(cfg.node_id or cfg.node_name)
+        if not has_lab_selector or not has_node_selector:
+            raise SessionError("provide one lab selector and one node selector, or set console_path")
+
+        token = self._cml_api_token(password=password)
+        lab_id = self._resolve_lab_id_via_api(token)
+        node_id = self._resolve_node_id_via_api(lab_id, token)
+        return f"/{lab_id}/{node_id}/{cfg.node_port}"
+
     def _open_shell_session(self, password: str | None = None) -> PtySession:
         cfg = self.config
+        console_path = self._resolve_console_path(password=password)
         ssh_cmd = [
             "ssh",
             "-tt",
             f"{cfg.user}@{cfg.jump_host}",
-            f"open {cfg.build_console_path()}",
+            f"open {console_path}",
         ]
 
         session = PtySession(ssh_cmd)
@@ -465,6 +599,55 @@ class TrexConsoleLauncher:
         finally:
             session.close()
 
+    def run_remote_python(
+        self,
+        script: str,
+        *,
+        password: str | None = None,
+        timeout: float | None = None,
+        workdir: str | None = None,
+        python_bin: str = "python3",
+    ) -> str:
+        session = self._open_shell_session(password=password)
+        wait_timeout = timeout or self.config.command_timeout
+        remote_path = f"/tmp/codex_remote_{int(time.time() * 1000)}.py"
+        try:
+            session.clear_buffer()
+            session.send_line(f"cat > {remote_path} <<'EOF'")
+            session.drain_output()
+            for line in script.rstrip().splitlines():
+                session.send_line(line)
+                session.drain_output()
+            # Drop echoed heredoc content so prompt detection after EOF cannot
+            # accidentally match a "#" inside a script comment.
+            session.clear_buffer()
+            session.send_line("EOF")
+            session.expect([PROMPT_RE], timeout=self.config.command_timeout, echo=False)
+
+            cmd = f"{python_bin} {shlex.quote(remote_path)}"
+            if workdir:
+                cmd = f"cd {shlex.quote(workdir)} && {cmd}"
+
+            # Drop any unread prompt noise from the heredoc completion before
+            # waiting for the Python helper to finish.
+            session.drain_output()
+            session.clear_buffer()
+            session.send_line(cmd)
+            session.expect([PROMPT_RE], timeout=wait_timeout, echo=False)
+            output = self._clean_output(session._buffer)
+
+            try:
+                session.drain_output()
+                session.clear_buffer()
+                session.send_line(f"rm -f {shlex.quote(remote_path)}")
+                session.expect([PROMPT_RE], timeout=self.config.command_timeout, echo=False)
+            except SessionError:
+                pass
+
+            return output
+        finally:
+            session.close()
+
     def run_console_batch(
         self,
         commands: Sequence[str],
@@ -474,22 +657,15 @@ class TrexConsoleLauncher:
         force_acquire: bool | None = None,
         readonly: bool | None = None,
         timeout: float | None = None,
+        delay_after_acquire: float | None = None,
     ) -> TrexConsoleBatchResult:
         cfg = self.config
         session = self._open_shell_session(password=password)
         batch_file = f"/tmp/codex_trex_batch_{int(time.time() * 1000)}.txt"
         timeout = timeout or cfg.console_timeout
         try:
-            self._ensure_server_running(session)
-
-            session.clear_buffer()
-            session.send_line(f"cat > {batch_file} <<'EOF'")
-            session.drain_output()
-            for command in commands:
-                session.send_line(command)
-                session.drain_output()
-            session.send_line("EOF")
-            session.expect([PROMPT_RE], timeout=cfg.command_timeout, echo=False)
+            if not self._server_ready_for_run:
+                self._ensure_server_running(session)
 
             argv = ["trex_console", "-s", "127.0.0.1"]
             selected_ports = list(ports) if ports is not None else []
@@ -505,6 +681,73 @@ class TrexConsoleLauncher:
                 argv.append("-f")
             elif readonly:
                 argv.append("-r")
+
+            requested_delay = delay_after_acquire
+            if requested_delay is None:
+                requested_delay = cfg.acquire_settle_time if force_acquire else 0.0
+            delay_after_acquire = requested_delay if self._needs_acquire_settle else 0.0
+
+            if delay_after_acquire and delay_after_acquire > 0:
+                session.clear_buffer()
+                session.send_line(
+                    build_console_start_cmd(
+                        readonly=readonly,
+                        force_acquire=bool(force_acquire),
+                    )
+                )
+                idx = session.expect(
+                    [TREX_PROMPT_RE, ACQUIRE_FAILED_RE],
+                    timeout=cfg.console_timeout,
+                    echo=False,
+                )
+                if idx == 1:
+                    output = self._clean_output(session._buffer)
+                    try:
+                        session.send_bytes(b"\x03")
+                        session.expect([PROMPT_RE], timeout=cfg.command_timeout, echo=False)
+                    except SessionError:
+                        pass
+                    return TrexConsoleBatchResult(success=False, output=output, batch_file=batch_file)
+
+                time.sleep(float(delay_after_acquire))
+                self._needs_acquire_settle = False
+                session.drain_output()
+                full_output = self._clean_output(session._buffer)
+                success = True
+                for command in commands:
+                    session.drain_output()
+                    session.clear_buffer()
+                    session.send_line(command)
+                    idx = session.expect([TREX_PROMPT_RE, PROMPT_RE], timeout=timeout, echo=False)
+                    full_output += self._clean_output(session._buffer)
+                    if idx == 1:
+                        success = False
+                        break
+                    if BATCH_ERROR_RE.search(session._buffer):
+                        success = False
+                        break
+
+                output = full_output
+                success = success and not bool(BATCH_ERROR_RE.search(output))
+                try:
+                    session.clear_buffer()
+                    session.send_line("quit")
+                    # TRex often exits by tearing down the tmux pane rather than
+                    # returning cleanly to a shell prompt. Do not spend the full
+                    # command timeout waiting for "#" after a successful quit.
+                    session.expect([PROMPT_RE], timeout=min(2.0, cfg.command_timeout), echo=False)
+                except SessionError:
+                    pass
+                return TrexConsoleBatchResult(success=success, output=output, batch_file=batch_file)
+
+            session.clear_buffer()
+            session.send_line(f"cat > {batch_file} <<'EOF'")
+            session.drain_output()
+            for command in commands:
+                session.send_line(command)
+                session.drain_output()
+            session.send_line("EOF")
+            session.expect([PROMPT_RE], timeout=cfg.command_timeout, echo=False)
 
             argv.extend(["--batch", batch_file])
             inner = (
@@ -529,7 +772,7 @@ class TrexConsoleLauncher:
                         break
                     continue
                 if chunk:
-                    session._buffer += chunk.decode("utf-8", errors="ignore")
+                    session._buffer += self._clean_output(chunk.decode("utf-8", errors="ignore"))
                     session._buffer = session._buffer[-50000:]
                 if BATCH_DONE_RE.search(session._buffer):
                     break

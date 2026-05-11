@@ -3,12 +3,14 @@
 
 How to use:
 1. Export the SSH password in ``TREXCMLLIB_PASSWORD`` or pass ``--password``.
-2. Provide the CML host, SSH user, lab name, node name, packet count, and the
+2. Provide the CML host, SSH user, lab selector, node selector, and the
    L3 configuration for the transmit port.
 3. Optionally configure a receive-side port if your topology expects return
    traffic or if you want the example to resolve both ports.
-4. The example first configures L3 mode and resolves ARP, then injects raw
-   packets using the resolved gateway MAC.
+4. Choose either packet mode with ``--packets`` or stream mode with ``--rate`` and ``--duration``.
+5. The example first configures L3 mode and resolves ARP, then sends either raw
+   packets or a sustained STL stream using the resolved gateway MAC.
+6. In packet mode, optionally tune ``--packet-pps`` to reduce burst-driven loss.
 
 Example CLI:
     TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
@@ -17,10 +19,24 @@ Example CLI:
       --lab-name <lab-name> \
       --node-name <node-name> \
       --packets 10 \
+      --packet-pps 50 \
       --tx-port 0 \
       --tx-src-ip 192.0.2.10 \
       --tx-next-hop 192.0.2.1 \
       --traffic-dst-ip 198.51.100.10
+
+Stream CLI:
+    TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
+      --cml-host <cml-host> \
+      --user <ssh-user> \
+      --lab-id <lab-id> \
+      --node-name <node-name> \
+      --tx-port 0 \
+      --tx-src-ip 192.0.2.10 \
+      --tx-next-hop 192.0.2.1 \
+      --traffic-dst-ip 198.51.100.10 \
+      --rate 10kpps \
+      --duration 10
 """
 
 from __future__ import annotations
@@ -35,6 +51,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from trexcmllib import TrexConsoleConfig, TrexTraffic
+from trexcmllib.examples.common import add_console_target_args, add_traffic_reset_args, console_target_kwargs, console_target_label, validate_console_target_args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,18 +68,28 @@ def build_parser() -> argparse.ArgumentParser:
             "    --tx-port 0 \\\n"
             "    --tx-src-ip 192.0.2.10 \\\n"
             "    --tx-next-hop 192.0.2.1 \\\n"
-            "    --traffic-dst-ip 198.51.100.10"
+            "    --traffic-dst-ip 198.51.100.10\n\n"
+            "Stream example:\n"
+            "  TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \\\n"
+            "    --cml-host <cml-host> \\\n"
+            "    --user <ssh-user> \\\n"
+            "    --lab-id <lab-id> \\\n"
+            "    --node-name <node-name> \\\n"
+            "    --tx-port 0 \\\n"
+            "    --tx-src-ip 192.0.2.10 \\\n"
+            "    --tx-next-hop 192.0.2.1 \\\n"
+            "    --traffic-dst-ip 198.51.100.10 \\\n"
+            "    --rate 10kpps \\\n"
+            "    --duration 10"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--cml-host", "--jump-host", dest="jump_host", required=True, help="CML terminal server hostname or IP")
-    parser.add_argument("--lab-name", required=True, help="CML lab name")
-    parser.add_argument("--node-name", required=True, help="TRex node name in the lab")
-    parser.add_argument("--node-port", default="0", help="CML console line index (default: 0)")
-    parser.add_argument("--user", required=True, help="SSH username for the CML host")
-    parser.add_argument("--password", default=None, help="SSH password for the CML host")
-    parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD", help="Environment variable used for the SSH password")
-    parser.add_argument("--packets", type=int, required=True, help="Number of L3 packets to inject from tx-port")
+    add_console_target_args(parser)
+    add_traffic_reset_args(parser)
+    parser.add_argument("--packets", type=int, default=None, help="Number of L3 packets to inject from tx-port in packet mode")
+    parser.add_argument("--packet-pps", type=int, default=50, help="Burst rate used in packet mode when --packets is provided (default: 50)")
+    parser.add_argument("--rate", default=None, help="Optional TRex stream rate, for example 10kpps, 100mbps, or 5%%")
+    parser.add_argument("--duration", type=float, default=10.0, help="Stream duration in seconds when --rate is used (default: 10)")
     parser.add_argument("--tx-port", type=int, default=0, help="TRex transmit port (default: 0)")
     parser.add_argument("--rx-port", type=int, default=None, help="Optional receive-side TRex port to also configure and summarize")
     parser.add_argument("--tx-src-ip", required=True, help="Source IPv4 to configure on tx-port")
@@ -81,19 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    validate_console_target_args(parser, args)
+    if args.rate is None and args.packets is None:
+        parser.error("provide --packets for packet mode, or --rate with --duration for stream mode")
+    if args.rate is not None and args.duration <= 0:
+        parser.error("--duration must be greater than 0 when --rate is used")
+    if args.packet_pps < 1:
+        parser.error("--packet-pps must be at least 1")
 
     traffic = TrexTraffic(
         TrexConsoleConfig(
-            jump_host=args.jump_host,
-            user=args.user,
-            lab_name=args.lab_name,
-            node_name=args.node_name,
-            node_port=str(args.node_port),
-            password=args.password,
-            password_env=args.password_env,
+            **console_target_kwargs(args),
             readonly=False,
             force_acquire=True,
-        )
+        ),
+        hard_reset=args.hard_reset,
     )
     result = traffic.run(
         "l3",
@@ -110,12 +139,17 @@ def main() -> int:
         udp_src_port=args.udp_src_port,
         udp_dst_port=args.udp_dst_port,
         tx_mac=args.tx_mac,
+        rate=args.rate,
+        duration=args.duration,
+        packet_pps=args.packet_pps,
         password=args.password,
     )
     summary = result.summary
+    lab_label, node_label = console_target_label(args)
 
     print(f"CML host         : {args.jump_host}")
-    print(f"Lab / node       : {args.lab_name} / {args.node_name}")
+    print(f"Lab / node       : {lab_label} / {node_label}")
+    print(f"Traffic mode     : {summary.get('mode', 'packet')}")
     print(f"Tx port          : {summary['tx_port']}")
     print(f"Tx source MAC    : {summary['tx_mac']}")
     print(f"Tx source IP     : {summary['tx_src_ip']}")
@@ -123,7 +157,12 @@ def main() -> int:
     print(f"Resolved NH MAC  : {summary.get('resolved_nh_mac', 'n/a')}")
     print(f"Traffic src IP   : {summary.get('traffic_src_ip', 'n/a')}")
     print(f"Traffic dst IP   : {summary.get('traffic_dst_ip', 'n/a')}")
-    print(f"Packets asked    : {summary.get('packets_asked', args.packets)}")
+    if summary.get("mode") == "stream":
+        print(f"Rate             : {summary.get('rate', 'n/a')}")
+        print(f"Duration         : {summary.get('duration', 0)}")
+    else:
+        print(f"Packets asked    : {summary.get('packets_asked', args.packets)}")
+        print(f"Packet PPS       : {summary.get('packet_pps', args.packet_pps)}")
     print(f"Packets sent     : {summary.get('packets_sent', 0)}")
     print(f"Bytes sent       : {summary.get('bytes_sent', 0)}")
     print(f"Tx errors        : {summary.get('tx_errors', 0)}")

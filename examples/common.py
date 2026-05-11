@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import re
+from typing import Any
 
 from trexcmllib import TrexConsoleLauncher
 
@@ -110,3 +112,52 @@ def loss_percent(sent: int, received: int) -> float:
     if sent <= 0:
         return 0.0
     return (loss_count(sent, received) / float(sent)) * 100.0
+
+
+def add_console_target_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cml-host", "--jump-host", dest="jump_host", required=True, help="CML terminal server hostname or IP")
+    parser.add_argument("--lab-name", default=None, help="CML lab name")
+    parser.add_argument("--node-name", default=None, help="TRex node name in the lab")
+    parser.add_argument("--lab-id", default=None, help="Optional CML lab id")
+    parser.add_argument("--node-id", default=None, help="Optional CML node id")
+    parser.add_argument("--node-port", default="0", help="CML console line index (default: 0)")
+    parser.add_argument("--user", required=True, help="SSH username for the CML host")
+    parser.add_argument("--password", default=None, help="SSH password for the CML host")
+    parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD", help="Environment variable used for the SSH password")
+
+
+def add_traffic_reset_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--hard-reset",
+        dest="hard_reset",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Restart the remote TRex server before the run to clear stale state (default: enabled)",
+    )
+
+
+def validate_console_target_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    console_path = getattr(args, "console_path", None)
+    has_lab_selector = bool(args.lab_name or args.lab_id)
+    has_node_selector = bool(args.node_name or args.node_id)
+    if not console_path and (not has_lab_selector or not has_node_selector):
+        parser.error("provide one lab selector (--lab-name or --lab-id) and one node selector (--node-name or --node-id)")
+
+
+def console_target_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "jump_host": args.jump_host,
+        "user": args.user,
+        "lab_name": args.lab_name or "",
+        "node_name": args.node_name or "",
+        "lab_id": args.lab_id or "",
+        "node_id": args.node_id or "",
+        "node_port": str(args.node_port),
+        "console_path": getattr(args, "console_path", None),
+        "password": args.password,
+        "password_env": args.password_env,
+    }
+
+
+def console_target_label(args: argparse.Namespace) -> tuple[str, str]:
+    return (args.lab_name or args.lab_id or "", args.node_name or args.node_id or "")

@@ -127,12 +127,22 @@ Useful fields:
 - `user`
 - `lab_name`
 - `node_name`
+- `lab_id`
+- `node_id`
 - `node_port`
+- `console_path`
 - `password` or `password_env`
 - `readonly`
 - `force_acquire`
 
 No real connection target is embedded in the library. Callers are expected to provide the host, user, lab, node, and credentials explicitly.
+
+Console targeting rules:
+
+- provide one lab selector: `lab_name` or `lab_id`
+- provide one node selector: `node_name` or `node_id`
+- if a name is provided, `trexcmllib` resolves the matching id through the CML API before opening the console
+- or pass `console_path` directly if you already know the exact CML terminal path
 
 ### `TrexConsoleLauncher`
 
@@ -200,6 +210,14 @@ Each call returns a `TrexTrafficResult` with:
 - `outputs`
 
 The example scripts under `trexcmllib.examples` are now thin CLI wrappers over `TrexTraffic`.
+
+Traffic run reset behavior:
+
+- `TrexTraffic` defaults to a clean-start model for traffic runs
+- before a traffic run starts, the remote TRex server is restarted into the requested mode so stale state from an aborted or unclean prior run does not leak into the next run
+- this applies to the `TrexTraffic`-based L2, L3, ping, and ASTF example scripts
+- `open_console` is different: it opens an interactive console without forcing that reset unless you implement that behavior yourself
+- the example CLIs expose this as `--hard-reset` and `--no-hard-reset`
 
 Important ASTF requirement:
 
@@ -276,6 +294,10 @@ traffic = TrexTraffic(
     )
 )
 
+# Disable the default clean-start restart only if you explicitly want to reuse
+# the current remote TRex server state.
+# traffic = TrexTraffic(config, hard_reset=False)
+
 result = traffic.run(
     "l2",
     packets=10,
@@ -288,9 +310,157 @@ print(result.summary["packet_loss"])
 print(result.outputs["traffic"])
 ```
 
+## Example: Run Unidirectional L3 Traffic
+
+```python
+from trexcmllib import TrexConsoleConfig, TrexTraffic
+
+traffic = TrexTraffic(
+    TrexConsoleConfig(
+        jump_host="<cml-host>",
+        user="<ssh-user>",
+        lab_name="<lab-name>",
+        node_name="<node-name>",
+        readonly=False,
+        force_acquire=True,
+    )
+)
+
+result = traffic.run(
+    "l3",
+    packets=10,
+    tx_port=0,
+    tx_src_ip="192.0.2.10",
+    tx_next_hop="192.0.2.1",
+    traffic_dst_ip="198.51.100.10",
+)
+
+print(result.success)
+print(result.summary["resolved_nh_mac"])
+print(result.summary["packets_sent"])
+print(result.outputs["setup"])
+print(result.outputs["traffic"])
+```
+
+## Example: Run Ping Validation
+
+```python
+from trexcmllib import PingProbe, TrexConsoleConfig, TrexTraffic
+
+traffic = TrexTraffic(
+    TrexConsoleConfig(
+        jump_host="<cml-host>",
+        user="<ssh-user>",
+        lab_name="<lab-name>",
+        node_name="<node-name>",
+        readonly=False,
+        force_acquire=True,
+    )
+)
+
+result = traffic.run(
+    "ping",
+    count=3,
+    pkt_size=64,
+    probes=[
+        PingProbe(
+            port=0,
+            src_ip="192.0.2.10",
+            next_hop_ip="192.0.2.1",
+            dst_ip="192.0.2.1",
+        ),
+    ],
+)
+
+print(result.success)
+print(result.summary["probe_results"][0]["resolved_nh_mac"])
+print(result.summary["probe_results"][0]["replies"])
+print(result.outputs["port_0"])
+```
+
+## Example: Run Bidirectional L3 Traffic
+
+```python
+from trexcmllib import TrexConsoleConfig, TrexTraffic
+
+traffic = TrexTraffic(
+    TrexConsoleConfig(
+        jump_host="<cml-host>",
+        user="<ssh-user>",
+        lab_name="<lab-name>",
+        node_name="<node-name>",
+        readonly=False,
+        force_acquire=True,
+    )
+)
+
+result = traffic.run(
+    "l3_bidirectional",
+    packets=10,
+    port_a=0,
+    port_b=1,
+    port_a_src_ip="192.0.2.10",
+    port_b_src_ip="192.0.2.20",
+    port_a_next_hop_ip="192.0.2.1",
+    port_b_next_hop_ip="192.0.2.2",
+    traffic_a_dst_ip="198.51.100.10",
+    traffic_b_dst_ip="198.51.100.20",
+)
+
+print(result.success)
+print(result.summary["loss_a_to_b"])
+print(result.summary["loss_b_to_a"])
+print(result.outputs["setup"])
+print(result.outputs["traffic"])
+```
+
 ## Example Scripts
 
-These examples can be run as modules when `scripts/` is on `PYTHONPATH`, or directly from the repo checkout.
+These examples can be run as modules when the parent directory of this repository is on `PYTHONPATH`, or by using the installed console scripts after `pip install`.
+
+All example scripts support the same CML target selection model:
+
+- one lab selector with `--lab-name` or `--lab-id`
+- one node selector with `--node-name` or `--node-id`
+- names are resolved to ids through the CML API before the console path is opened
+- `--node-port` remains optional and defaults to `0`
+
+For all examples below:
+
+- you must provide `--cml-host` and `--user`
+- you must provide one lab selector and one node selector
+- you can provide the SSH secret either with `--password` or through the password environment variable
+
+## Traffic Parameters
+
+Current traffic customization support:
+
+- `run_l2_traffic` and `run_l2_bidirectional`
+  - packet mode: supported with `--packets`
+  - stream mode: supported with `--rate` and `--duration`
+  - stream frame size: supported with `--frame-size`
+- `run_l3_traffic` and `run_l3_bidirectional`
+  - packet mode: supported with `--packets`
+  - stream mode: supported with `--rate` and `--duration`
+  - packet and stream payload size: supported with `--payload-bytes`
+- `run_ping`
+  - ping count: supported with `--count`
+  - packet size: supported with `--pkt-size`
+- `run_astf_http` and `run_astf_udp`
+  - duration: supported with `--duration`
+  - traffic rate/load: supported with `--multiplier`
+
+Stream rate format:
+
+- stream mode accepts TRex rate strings such as `10kpps`, `100mbps`, or `5%`
+- L2 and L3 stream mode uses sustained STL streams on the TRex node instead of repeated `pkt` injections
+
+Clean-start behavior:
+
+- the traffic example scripts use `TrexTraffic`, which restarts the remote TRex server before each run by default
+- this is intentional so a previously aborted run does not leave stale ports, streams, or server mode behind
+- interactive `open_console` usage does not force that restart by default
+- use `--no-hard-reset` only when you explicitly want to reuse the current remote TRex server state
 
 ### Open Console
 
@@ -304,6 +474,26 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.open_console
 
 ### Unidirectional L2 Traffic
 
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- one lab selector: `--lab-name` or `--lab-id`
+- one node selector: `--node-name` or `--node-id`
+- either `--packets`, or both `--rate` and `--duration`
+
+Optional parameters:
+
+- `--node-port`
+- `--rate`
+- `--duration`
+- `--frame-size`
+- `--tx-port`
+- `--rx-port`
+- `--tx-mac`
+- `--rx-mac`
+- `--password` or `--password-env`
+
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_traffic \
   --cml-host <cml-host> \
@@ -313,7 +503,38 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_traff
   --packets 10
 ```
 
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_traffic \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-id <lab-id> \
+  --node-id <node-id> \
+  --rate 10kpps \
+  --duration 10 \
+  --frame-size 256
+```
+
 ### Bidirectional L2 Traffic
+
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- one lab selector: `--lab-name` or `--lab-id`
+- one node selector: `--node-name` or `--node-id`
+- either `--packets`, or both `--rate` and `--duration`
+
+Optional parameters:
+
+- `--node-port`
+- `--rate`
+- `--duration`
+- `--frame-size`
+- `--port-a`
+- `--port-b`
+- `--port-a-mac`
+- `--port-b-mac`
+- `--password` or `--password-env`
 
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_bidirectional \
@@ -324,7 +545,44 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_bidir
   --packets 10
 ```
 
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l2_bidirectional \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-id <lab-id> \
+  --node-id <node-id> \
+  --rate 10kpps \
+  --duration 10
+```
+
 ### L3 Traffic
+
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- one lab selector: `--lab-name` or `--lab-id`
+- one node selector: `--node-name` or `--node-id`
+- `--tx-src-ip`
+- `--tx-next-hop`
+- either `--packets`, or both `--rate` and `--duration`
+
+Optional parameters:
+
+- `--node-port`
+- `--rate`
+- `--duration`
+- `--tx-port`
+- `--rx-port`
+- `--rx-src-ip`
+- `--rx-next-hop`
+- `--traffic-src-ip`
+- `--traffic-dst-ip`
+- `--payload-bytes`
+- `--udp-src-port`
+- `--udp-dst-port`
+- `--tx-mac`
+- `--password` or `--password-env`
 
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
@@ -339,7 +597,49 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traff
   --traffic-dst-ip 198.51.100.10
 ```
 
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_traffic \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-id <lab-id> \
+  --node-id <node-id> \
+  --tx-port 0 \
+  --tx-src-ip 192.0.2.10 \
+  --tx-next-hop 192.0.2.1 \
+  --traffic-dst-ip 198.51.100.10 \
+  --rate 10kpps \
+  --duration 10
+```
+
 ### Bidirectional L3 Traffic
+
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- one lab selector: `--lab-name` or `--lab-id`
+- one node selector: `--node-name` or `--node-id`
+- `--port-a-src-ip`
+- `--port-b-src-ip`
+- `--traffic-a-dst-ip`
+- `--traffic-b-dst-ip`
+- either `--packets`, or both `--rate` and `--duration`
+- either both `--port-a-next-hop-ip` and `--port-b-next-hop-ip`
+- or both `--port-a-next-hop-mac` and `--port-b-next-hop-mac`
+
+Optional parameters:
+
+- `--node-port`
+- `--rate`
+- `--duration`
+- `--port-a`
+- `--port-b`
+- `--payload-bytes`
+- `--udp-src-port`
+- `--udp-dst-port`
+- `--port-a-mac`
+- `--port-b-mac`
+- `--password` or `--password-env`
 
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_bidirectional \
@@ -356,7 +656,39 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_bidir
   --traffic-b-dst-ip 198.51.100.20
 ```
 
+```bash
+TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_l3_bidirectional \
+  --cml-host <cml-host> \
+  --user <ssh-user> \
+  --lab-id <lab-id> \
+  --node-id <node-id> \
+  --port-a-src-ip 192.0.2.10 \
+  --port-b-src-ip 192.0.2.20 \
+  --port-a-next-hop-ip 192.0.2.1 \
+  --port-b-next-hop-ip 192.0.2.2 \
+  --traffic-a-dst-ip 198.51.100.10 \
+  --traffic-b-dst-ip 198.51.100.20 \
+  --rate 10kpps \
+  --duration 10
+```
+
 ### Ping Validation
+
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- one lab selector: `--lab-name` or `--lab-id`
+- one node selector: `--node-name` or `--node-id`
+- at least one `--probe`
+
+Optional parameters:
+
+- `--node-port`
+- `--count`
+- `--pkt-size`
+- `--show-raw-output`
+- `--password` or `--password-env`
 
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
@@ -367,6 +699,39 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
   --count 3 \
   --probe 0:192.0.2.10:192.0.2.1:192.0.2.1
 ```
+
+The `--probe` format is:
+
+```text
+PORT:SRC_IP:NEXT_HOP_IP:DST_IP
+```
+
+Meaning:
+
+- `PORT`: TRex port id
+- `SRC_IP`: source IP configured on that TRex port
+- `NEXT_HOP_IP`: gateway / next-hop TRex must ARP-resolve on that port
+- `DST_IP`: final ICMP destination carried in the ping packet
+
+Examples:
+
+- ping the gateway itself:
+
+```bash
+--probe 0:192.0.2.10:192.0.2.1:192.0.2.1
+```
+
+- ping a remote host through the gateway:
+
+```bash
+--probe 0:192.0.2.10:192.0.2.1:198.51.100.10
+```
+
+Important:
+
+- the third field is the next hop, not the final ping destination
+- the `l3 -p ... --dst ...` command uses `NEXT_HOP_IP`
+- the `ping -d ...` command uses `DST_IP`
 
 Default behavior:
 
@@ -402,6 +767,23 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_ping \
 
 ### ASTF HTTP Application Traffic
 
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- either `--lab-name` and `--node-name`, or `--lab-id` and `--node-id`
+
+Optional parameters:
+
+- `--node-port`
+- `--profile`
+- `--profile-id`
+- `--duration`
+- `--multiplier`
+- `--latency-pps`
+- `--ipv6`
+- `--password` or `--password-env`
+
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_astf_http \
   --cml-host <cml-host> \
@@ -413,6 +795,23 @@ TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_astf_htt
 ```
 
 ### ASTF UDP Stateful Traffic
+
+Mandatory parameters:
+
+- `--cml-host`
+- `--user`
+- either `--lab-name` and `--node-name`, or `--lab-id` and `--node-id`
+
+Optional parameters:
+
+- `--node-port`
+- `--profile`
+- `--profile-id`
+- `--duration`
+- `--multiplier`
+- `--latency-pps`
+- `--ipv6`
+- `--password` or `--password-env`
 
 ```bash
 TREXCMLLIB_PASSWORD='<ssh-password>' python3 -m trexcmllib.examples.run_astf_udp \
@@ -498,6 +897,8 @@ For the `run_l3_bidirectional` example:
 For the `run_ping` example:
 
 - each `--probe` is `PORT:SRC_IP:NEXT_HOP_IP:DST_IP`
+- the third field is the gateway / next-hop TRex must resolve on that port
+- the fourth field is the final ICMP destination
 - the next hop must answer ARP on that specific TRex link
 - the destination must answer ICMP through that same path
 - if a TRex port is connected only to a local loop or an otherwise empty switch segment, ping validation will fail at L3 resolution because there is no real remote endpoint

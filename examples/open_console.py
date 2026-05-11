@@ -28,6 +28,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from trexcmllib import SessionError, TrexConsoleConfig, TrexConsoleLauncher
+from trexcmllib.examples.common import add_console_target_args, console_target_kwargs, validate_console_target_args
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,14 +46,8 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.set_defaults(readonly=True)
-    parser.add_argument("--cml-host", "--jump-host", dest="jump_host", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--lab-name", required=True)
-    parser.add_argument("--node-name", required=True)
-    parser.add_argument("--node-port", default="0")
+    add_console_target_args(parser)
     parser.add_argument("--console-path")
-    parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD")
-    parser.add_argument("--password")
     parser.add_argument("--server-mode", choices=("stl", "astf"), default="stl")
     parser.add_argument("--connect-timeout", type=float, default=30.0)
     parser.add_argument("--command-timeout", type=float, default=20.0)
@@ -66,17 +61,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(prog="open_console")
     args = parse_args()
+    validate_console_target_args(parser, args)
     launcher = TrexConsoleLauncher(
         TrexConsoleConfig(
-            jump_host=args.jump_host,
-            user=args.user,
-            lab_name=args.lab_name,
-            node_name=args.node_name,
-            node_port=args.node_port,
-            console_path=args.console_path,
-            password_env=args.password_env,
-            password=args.password,
+            **console_target_kwargs(args),
             server_mode=args.server_mode,
             connect_timeout=args.connect_timeout,
             command_timeout=args.command_timeout,

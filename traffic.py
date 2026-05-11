@@ -40,6 +40,7 @@ PING_TIMEOUT_RE = re.compile(r"Request timed out\.", re.IGNORECASE)
 PING_UNREACHABLE_RE = re.compile(r"Reply from (?P<ip>[0-9a-f:.]+): Destination host unreachable", re.IGNORECASE)
 ASTF_JSON_RE = re.compile(r"__TREXCMLLIB_ASTF_JSON__(?P<json>\{.*\})", re.DOTALL)
 ASTF_PREFLIGHT_RE = re.compile(r"__TREXCMLLIB_ASTF_PREFLIGHT__(?P<json>\{.*\})", re.DOTALL)
+STL_JSON_RE = re.compile(r"__TREXCMLLIB_STL_JSON__(?P<json>\{.*\})", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,33 +102,45 @@ class TrexTraffic:
         config: TrexConsoleConfig | None = None,
         *,
         launcher: TrexConsoleLauncher | None = None,
+        hard_reset: bool = True,
     ) -> None:
         if launcher is None:
             if config is None:
                 raise ValueError("either config or launcher is required")
             launcher = TrexConsoleLauncher(config)
+        launcher.config.hard_reset = hard_reset
         self.launcher = launcher
         self.astf_runner = TrexAstfConsoleRunner(launcher)
 
     def run(self, kind: str, /, **kwargs: Any) -> TrexTrafficResult:
         normalized = kind.lower()
-        if normalized == "l2":
-            return self.run_l2(**kwargs)
-        if normalized in {"l2_bidirectional", "l2-bidirectional"}:
-            return self.run_l2_bidirectional(**kwargs)
-        if normalized == "l3":
-            return self.run_l3(**kwargs)
-        if normalized in {"l3_bidirectional", "l3-bidirectional"}:
-            return self.run_l3_bidirectional(**kwargs)
-        if normalized == "ping":
-            return self.run_ping(**kwargs)
-        if normalized in {"astf", "astf_profile", "astf-profile"}:
-            return self.run_astf_profile(**kwargs)
-        if normalized in {"astf_http", "astf-http"}:
-            return self.run_astf_http(**kwargs)
-        if normalized in {"astf_udp", "astf-udp"}:
-            return self.run_astf_udp(**kwargs)
-        raise ValueError(f"unsupported traffic kind: {kind}")
+        original_hard_reset = self.launcher.config.hard_reset
+        self.launcher.ensure_server_running(password=kwargs.get("password"))
+        self.launcher._server_ready_for_run = True
+        self.launcher._needs_acquire_settle = bool(original_hard_reset)
+        self.launcher.config.hard_reset = False
+        try:
+            if normalized == "l2":
+                return self.run_l2(**kwargs)
+            if normalized in {"l2_bidirectional", "l2-bidirectional"}:
+                return self.run_l2_bidirectional(**kwargs)
+            if normalized == "l3":
+                return self.run_l3(**kwargs)
+            if normalized in {"l3_bidirectional", "l3-bidirectional"}:
+                return self.run_l3_bidirectional(**kwargs)
+            if normalized == "ping":
+                return self.run_ping(**kwargs)
+            if normalized in {"astf", "astf_profile", "astf-profile"}:
+                return self.run_astf_profile(**kwargs)
+            if normalized in {"astf_http", "astf-http"}:
+                return self.run_astf_http(**kwargs)
+            if normalized in {"astf_udp", "astf-udp"}:
+                return self.run_astf_udp(**kwargs)
+            raise ValueError(f"unsupported traffic kind: {kind}")
+        finally:
+            self.launcher._server_ready_for_run = False
+            self.launcher._needs_acquire_settle = False
+            self.launcher.config.hard_reset = original_hard_reset
 
     def discover_port_macs(self, *, password: str | None = None) -> dict[int, dict[str, str]]:
         remote_shell = (
@@ -206,6 +219,137 @@ class TrexTraffic:
             "unreachable_count": len(unreachable),
             "unreachable_ips": unreachable,
         }
+
+    @staticmethod
+    def _metrics_from_port_stats(port_stats: dict[str, Any]) -> dict[str, dict[Any, int]]:
+        metrics: dict[str, dict[Any, int]] = {}
+        for port_key, values in port_stats.items():
+            if not isinstance(values, dict):
+                continue
+            try:
+                port = int(port_key)
+            except (TypeError, ValueError):
+                continue
+            for metric, value in values.items():
+                if isinstance(value, (int, float)):
+                    metrics.setdefault(metric, {})[port] = int(value)
+        return metrics
+
+    def _run_remote_stl_streams(
+        self,
+        *,
+        ports: list[int],
+        stream_specs: list[dict[str, Any]],
+        rate: str | None = None,
+        duration: float | None = None,
+        count: int | None = None,
+        packet_pps: int = 50,
+        password: str | None = None,
+    ) -> tuple[bool, dict[str, Any], dict[str, dict[Any, int]], str]:
+        remote_script = textwrap.dedent(
+            f"""
+            import json
+            import os
+            import shutil
+            import sys
+            import types
+
+            dist = types.ModuleType("distutils")
+            spawn = types.ModuleType("distutils.spawn")
+            spawn.find_executable = shutil.which
+            dist.spawn = spawn
+            sys.modules["distutils"] = dist
+            sys.modules["distutils.spawn"] = spawn
+            sys.path.insert(0, os.getcwd())
+
+            payload = {{"success": False, "error": None, "port_stats": {{}}}}
+            client = None
+            try:
+                from trex.stl.api import IP, TCP, UDP, Ether, Raw, STLClient, STLPktBuilder, STLStream, STLTXCont, STLTXSingleBurst
+
+                ports = {ports!r}
+                stream_specs = json.loads({json.dumps(json.dumps(stream_specs))})
+                rate = {rate!r}
+                duration = {float(duration) if duration is not None else None!r}
+                count = {count!r}
+                packet_pps = {int(packet_pps)!r}
+
+                client = STLClient(server="127.0.0.1")
+                client.connect()
+                client.acquire(ports=ports, force=True)
+                client.remove_all_streams(ports=ports)
+                client.clear_stats(ports=ports)
+
+                for spec in stream_specs:
+                    if spec["kind"] == "l2":
+                        packet = Ether(src=spec["src_mac"], dst=spec["dst_mac"], type=spec["eth_type"])
+                    else:
+                        packet = Ether(src=spec["src_mac"], dst=spec["dst_mac"])
+                        packet /= IP(src=spec["src_ip"], dst=spec["dst_ip"])
+                        if spec["protocol"] == "tcp":
+                            packet /= TCP(sport=spec["udp_src_port"], dport=spec["udp_dst_port"])
+                        else:
+                            packet /= UDP(sport=spec["udp_src_port"], dport=spec["udp_dst_port"])
+
+                    pad_len = max(0, int(spec["frame_size"]) - len(packet))
+                    if pad_len:
+                        packet /= Raw(b"x" * pad_len)
+
+                    if count is None:
+                        mode = STLTXCont(pps=1)
+                    else:
+                        mode = STLTXSingleBurst(pps=packet_pps, total_pkts=count)
+                    stream = STLStream(packet=STLPktBuilder(pkt=packet), mode=mode)
+                    client.add_streams(stream, ports=spec["port"])
+
+                if count is None:
+                    client.start(ports=ports, mult=rate, duration=duration)
+                    wait_timeout = max(60.0, duration + 30.0)
+                else:
+                    client.start(ports=ports)
+                    wait_timeout = max(60.0, float(count) / 1000.0 + 30.0)
+                client.wait_on_traffic(ports=ports, timeout=wait_timeout)
+                raw_stats = client.get_stats(ports=ports, sync_now=True)
+                for port in ports:
+                    values = raw_stats.get(port) or raw_stats.get(str(port)) or {{}}
+                    payload["port_stats"][str(port)] = {{
+                        key: int(value)
+                        for key, value in values.items()
+                        if isinstance(value, (int, float))
+                    }}
+                payload["success"] = True
+            except Exception as exc:  # pragma: no cover - remote node only
+                payload["error"] = str(exc)
+            finally:
+                if client is not None:
+                    try:
+                        client.stop(ports=ports)
+                    except Exception:
+                        pass
+                    try:
+                        client.release(ports=ports)
+                    except Exception:
+                        pass
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+
+            print("__TREXCMLLIB_STL_JSON__" + json.dumps(payload))
+            """
+        )
+        output = self.launcher.run_remote_python(
+            remote_script,
+            password=password,
+            timeout=max(90.0, (float(duration) if duration is not None else 0.0) + 60.0),
+            workdir="/trex/automation/trex_control_plane/interactive",
+        )
+        match = STL_JSON_RE.search(output)
+        if not match:
+            return False, {"error": "failed to parse remote STL stream output"}, {}, output
+        payload = json.loads(match.group("json"))
+        metrics = self._metrics_from_port_stats(payload.get("port_stats", {}))
+        return bool(payload.get("success")), payload, metrics, output
 
     def _resolve_port_mac(self, port: int, override: str | None, *, password: str | None = None) -> str:
         if override:
@@ -296,26 +440,108 @@ class TrexTraffic:
     def run_l2(
         self,
         *,
-        packets: int,
+        packets: int | None = None,
         tx_port: int = 0,
         rx_port: int = 1,
         tx_mac: str | None = None,
         rx_mac: str | None = None,
+        rate: str | None = None,
+        duration: float = 10.0,
+        frame_size: int = 64,
+        packet_pps: int = 50,
         password: str | None = None,
     ) -> TrexTrafficResult:
-        if packets < 1:
-            raise ValueError("packets must be at least 1")
+        if rate is None:
+            if packets is None or packets < 1:
+                raise ValueError("packets must be at least 1 when rate is not provided")
+        elif duration <= 0:
+            raise ValueError("duration must be greater than 0 when rate is provided")
+        if packet_pps < 1:
+            raise ValueError("packet_pps must be at least 1")
 
         tx_mac, rx_mac = self._resolve_two_port_macs(tx_port, rx_port, tx_mac, rx_mac, password=password)
-        commands = [
+        setup = [
             f"service -p {tx_port} {rx_port}",
             f"l2 -p {tx_port} --dst {rx_mac}",
             f"l2 -p {rx_port} --dst {tx_mac}",
             f"service --off -p {tx_port} {rx_port}",
-            "clear",
         ]
+        setup_batch = self.launcher.run_console_batch(
+            setup,
+            password=password,
+            ports=[tx_port, rx_port],
+            force_acquire=True,
+            readonly=False,
+            timeout=40.0,
+        )
+        if not setup_batch.success:
+            return TrexTrafficResult(
+                "l2",
+                False,
+                {
+                    "mode": "stream" if rate is not None else "packet",
+                    "tx_port": tx_port,
+                    "rx_port": rx_port,
+                    "tx_mac": tx_mac,
+                    "rx_mac": rx_mac,
+                    "batch_success": False,
+                },
+                {},
+                {"setup": setup_batch.output},
+            )
+
+        if rate is not None:
+            remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
+                ports=[tx_port],
+                stream_specs=[
+                    {
+                        "kind": "l2",
+                        "port": tx_port,
+                        "src_mac": tx_mac,
+                        "dst_mac": rx_mac,
+                        "eth_type": 0x88B5,
+                        "frame_size": frame_size,
+                        "udp_src_port": 0,
+                        "udp_dst_port": 0,
+                    }
+                ],
+                rate=rate,
+                duration=duration,
+                password=password,
+            )
+            tx_packets = metrics.get("opackets", {}).get(tx_port, 0)
+            rx_packets = metrics.get("ipackets", {}).get(rx_port, 0)
+            tx_bytes = metrics.get("obytes", {}).get(tx_port, 0)
+            rx_bytes = metrics.get("ibytes", {}).get(rx_port, 0)
+            tx_errors = metrics.get("oerrors", {}).get(tx_port, 0)
+            rx_errors = metrics.get("ierrors", {}).get(rx_port, 0)
+            summary = {
+                "mode": "stream",
+                "rate": rate,
+                "duration": duration,
+                "frame_size": frame_size,
+                "tx_port": tx_port,
+                "rx_port": rx_port,
+                "tx_mac": tx_mac,
+                "rx_mac": rx_mac,
+                "packets_sent": tx_packets,
+                "packets_received": rx_packets,
+                "packet_loss": loss_count(tx_packets, rx_packets),
+                "packet_loss_pct": loss_percent(tx_packets, rx_packets),
+                "bytes_sent": tx_bytes,
+                "bytes_received": rx_bytes,
+                "tx_errors": tx_errors,
+                "rx_errors": rx_errors,
+                "batch_success": remote_success,
+            }
+            if payload.get("error"):
+                summary["error"] = payload["error"]
+            success = remote_success and tx_packets > 0 and rx_packets > 0 and tx_errors == 0 and rx_errors == 0
+            return TrexTrafficResult("l2", success, summary, metrics, {"setup": setup_batch.output, "traffic": remote_output})
+
+        commands = ["clear"]
         packet_cmd = f"pkt -p {tx_port} -s Ether(src='{tx_mac}',dst='{rx_mac}')/IP()/UDP()/('x'*10)"
-        commands.extend([packet_cmd] * packets)
+        commands.extend([packet_cmd] * int(packets))
         commands.extend(["stats", f"release -p {tx_port} {rx_port}"])
         batch = self.launcher.run_console_batch(
             commands,
@@ -334,11 +560,13 @@ class TrexTraffic:
         tx_errors = metrics.get("oerrors", {}).get(tx_port, 0)
         rx_errors = metrics.get("ierrors", {}).get(rx_port, 0)
         summary = {
+            "mode": "packet",
             "tx_port": tx_port,
             "rx_port": rx_port,
             "tx_mac": tx_mac,
             "rx_mac": rx_mac,
-            "packets_asked": packets,
+            "packet_pps": packet_pps,
+            "packets_asked": int(packets),
             "packets_sent": tx_packets,
             "packets_received": rx_packets,
             "packet_loss": loss_count(tx_packets, rx_packets),
@@ -350,32 +578,144 @@ class TrexTraffic:
             "batch_success": batch.success,
         }
         success = batch.success and tx_packets == packets and rx_packets == packets and tx_errors == 0 and rx_errors == 0
-        return TrexTrafficResult("l2", success, summary, metrics, {"traffic": batch.output})
+        return TrexTrafficResult("l2", success, summary, metrics, {"setup": setup_batch.output, "traffic": batch.output})
 
     def run_l2_bidirectional(
         self,
         *,
-        packets: int,
+        packets: int | None = None,
         port_a: int = 0,
         port_b: int = 1,
         port_a_mac: str | None = None,
         port_b_mac: str | None = None,
+        rate: str | None = None,
+        duration: float = 10.0,
+        frame_size: int = 64,
+        packet_pps: int = 50,
         password: str | None = None,
     ) -> TrexTrafficResult:
-        if packets < 1:
-            raise ValueError("packets must be at least 1")
+        if rate is None:
+            if packets is None or packets < 1:
+                raise ValueError("packets must be at least 1 when rate is not provided")
+        elif duration <= 0:
+            raise ValueError("duration must be greater than 0 when rate is provided")
+        if packet_pps < 1:
+            raise ValueError("packet_pps must be at least 1")
 
         port_a_mac, port_b_mac = self._resolve_two_port_macs(port_a, port_b, port_a_mac, port_b_mac, password=password)
-        commands = [
+        setup = [
             f"service -p {port_a} {port_b}",
             f"l2 -p {port_a} --dst {port_b_mac}",
             f"l2 -p {port_b} --dst {port_a_mac}",
             f"service --off -p {port_a} {port_b}",
-            "clear",
         ]
+        setup_batch = self.launcher.run_console_batch(
+            setup,
+            password=password,
+            ports=[port_a, port_b],
+            force_acquire=True,
+            readonly=False,
+            timeout=40.0,
+        )
+        if not setup_batch.success:
+            return TrexTrafficResult(
+                "l2_bidirectional",
+                False,
+                {
+                    "mode": "stream" if rate is not None else "packet",
+                    "port_a": port_a,
+                    "port_b": port_b,
+                    "port_a_mac": port_a_mac,
+                    "port_b_mac": port_b_mac,
+                    "batch_success": False,
+                },
+                {},
+                {"setup": setup_batch.output},
+            )
+
+        if rate is not None:
+            remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
+                ports=[port_a, port_b],
+                stream_specs=[
+                    {
+                        "kind": "l2",
+                        "port": port_a,
+                        "src_mac": port_a_mac,
+                        "dst_mac": port_b_mac,
+                        "eth_type": 0x88B5,
+                        "frame_size": frame_size,
+                        "udp_src_port": 0,
+                        "udp_dst_port": 0,
+                    },
+                    {
+                        "kind": "l2",
+                        "port": port_b,
+                        "src_mac": port_b_mac,
+                        "dst_mac": port_a_mac,
+                        "eth_type": 0x88B5,
+                        "frame_size": frame_size,
+                        "udp_src_port": 0,
+                        "udp_dst_port": 0,
+                    },
+                ],
+                rate=rate,
+                duration=duration,
+                password=password,
+            )
+            a_tx = metrics.get("opackets", {}).get(port_a, 0)
+            a_rx = metrics.get("ipackets", {}).get(port_a, 0)
+            b_tx = metrics.get("opackets", {}).get(port_b, 0)
+            b_rx = metrics.get("ipackets", {}).get(port_b, 0)
+            a_tx_bytes = metrics.get("obytes", {}).get(port_a, 0)
+            a_rx_bytes = metrics.get("ibytes", {}).get(port_a, 0)
+            b_tx_bytes = metrics.get("obytes", {}).get(port_b, 0)
+            b_rx_bytes = metrics.get("ibytes", {}).get(port_b, 0)
+            a_oerrors = metrics.get("oerrors", {}).get(port_a, 0)
+            a_ierrors = metrics.get("ierrors", {}).get(port_a, 0)
+            b_oerrors = metrics.get("oerrors", {}).get(port_b, 0)
+            b_ierrors = metrics.get("ierrors", {}).get(port_b, 0)
+            sent_total = a_tx + b_tx
+            received_total = a_rx + b_rx
+            summary = {
+                "mode": "stream",
+                "rate": rate,
+                "duration": duration,
+                "frame_size": frame_size,
+                "port_a": port_a,
+                "port_b": port_b,
+                "port_a_mac": port_a_mac,
+                "port_b_mac": port_b_mac,
+                "port_a_sent": a_tx,
+                "port_a_received": a_rx,
+                "port_b_sent": b_tx,
+                "port_b_received": b_rx,
+                "port_a_tx_bytes": a_tx_bytes,
+                "port_a_rx_bytes": a_rx_bytes,
+                "port_b_tx_bytes": b_tx_bytes,
+                "port_b_rx_bytes": b_rx_bytes,
+                "loss_a_to_b": loss_count(a_tx, b_rx),
+                "loss_a_to_b_pct": loss_percent(a_tx, b_rx),
+                "loss_b_to_a": loss_count(b_tx, a_rx),
+                "loss_b_to_a_pct": loss_percent(b_tx, a_rx),
+                "total_sent": sent_total,
+                "total_received": received_total,
+                "total_loss": loss_count(sent_total, received_total),
+                "total_loss_pct": loss_percent(sent_total, received_total),
+                "port_a_tx_errors": a_oerrors,
+                "port_a_rx_errors": a_ierrors,
+                "port_b_tx_errors": b_oerrors,
+                "port_b_rx_errors": b_ierrors,
+                "batch_success": remote_success,
+            }
+            if payload.get("error"):
+                summary["error"] = payload["error"]
+            success = remote_success and a_tx > 0 and a_rx > 0 and b_tx > 0 and b_rx > 0 and a_oerrors == 0 and a_ierrors == 0 and b_oerrors == 0 and b_ierrors == 0
+            return TrexTrafficResult("l2_bidirectional", success, summary, metrics, {"setup": setup_batch.output, "traffic": remote_output})
+
+        commands = ["clear"]
         pkt_a = f"pkt -p {port_a} -s Ether(src='{port_a_mac}',dst='{port_b_mac}')/IP()/UDP()/('x'*10)"
         pkt_b = f"pkt -p {port_b} -s Ether(src='{port_b_mac}',dst='{port_a_mac}')/IP()/UDP()/('x'*10)"
-        for _ in range(packets):
+        for _ in range(int(packets)):
             commands.append(pkt_a)
             commands.append(pkt_b)
         commands.extend(["stats", f"release -p {port_a} {port_b}"])
@@ -404,12 +744,14 @@ class TrexTraffic:
         sent_total = a_tx + b_tx
         received_total = a_rx + b_rx
         summary = {
+            "mode": "packet",
             "port_a": port_a,
             "port_b": port_b,
             "port_a_mac": port_a_mac,
             "port_b_mac": port_b_mac,
-            "packets_per_port": packets,
-            "expected_total": packets * 2,
+            "packet_pps": packet_pps,
+            "packets_per_port": int(packets),
+            "expected_total": int(packets) * 2,
             "port_a_sent": a_tx,
             "port_a_received": a_rx,
             "port_b_sent": b_tx,
@@ -443,12 +785,12 @@ class TrexTraffic:
             and b_oerrors == 0
             and b_ierrors == 0
         )
-        return TrexTrafficResult("l2_bidirectional", success, summary, metrics, {"traffic": batch.output})
+        return TrexTrafficResult("l2_bidirectional", success, summary, metrics, {"setup": setup_batch.output, "traffic": batch.output})
 
     def run_l3(
         self,
         *,
-        packets: int,
+        packets: int | None = None,
         tx_port: int = 0,
         tx_src_ip: str,
         tx_next_hop: str,
@@ -461,10 +803,18 @@ class TrexTraffic:
         udp_src_port: int = 1025,
         udp_dst_port: int = 12,
         tx_mac: str | None = None,
+        rate: str | None = None,
+        duration: float = 10.0,
+        packet_pps: int = 50,
         password: str | None = None,
     ) -> TrexTrafficResult:
-        if packets < 1:
-            raise ValueError("packets must be at least 1")
+        if rate is None:
+            if packets is None or packets < 1:
+                raise ValueError("packets must be at least 1 when rate is not provided")
+        elif duration <= 0:
+            raise ValueError("duration must be greater than 0 when rate is provided")
+        if packet_pps < 1:
+            raise ValueError("packet_pps must be at least 1")
         tx_mac = self._resolve_port_mac(tx_port, tx_mac, password=password)
         ports = [tx_port]
         setup = [f"service -p {tx_port}"]
@@ -485,52 +835,126 @@ class TrexTraffic:
             force_acquire=True,
             readonly=False,
             timeout=60.0,
+            delay_after_acquire=self.launcher.config.acquire_settle_time,
         )
         arp_replies = self.parse_arp_replies(setup_batch.output)
         tx_reply = arp_replies.get(tx_port)
         if not setup_batch.success or not tx_reply:
+            summary: dict[str, Any] = {
+                "mode": "stream" if rate is not None else "packet",
+                "tx_port": tx_port,
+                "tx_mac": tx_mac,
+                "tx_src_ip": tx_src_ip,
+                "tx_next_hop": tx_next_hop,
+                "traffic_src_ip": traffic_src_ip or tx_src_ip,
+                "traffic_dst_ip": traffic_dst_ip or tx_next_hop,
+                "batch_success": setup_batch.success,
+                "resolved_nh_mac": tx_reply["mac"] if tx_reply else None,
+                "error": "setup failed before traffic start",
+            }
+            if rate is not None:
+                summary.update({"rate": rate, "duration": duration})
+            else:
+                summary["packets_asked"] = int(packets) if packets is not None else None
             return TrexTrafficResult(
                 "l3",
                 False,
-                {
-                    "tx_port": tx_port,
-                    "tx_mac": tx_mac,
-                    "tx_src_ip": tx_src_ip,
-                    "tx_next_hop": tx_next_hop,
-                    "traffic_src_ip": traffic_src_ip or tx_src_ip,
-                    "traffic_dst_ip": traffic_dst_ip or tx_next_hop,
-                    "batch_success": setup_batch.success,
-                    "resolved_nh_mac": tx_reply["mac"] if tx_reply else None,
-                },
+                summary,
                 {},
                 {"setup": setup_batch.output},
             )
 
         traffic_src_ip = traffic_src_ip or tx_src_ip
         traffic_dst_ip = traffic_dst_ip or tx_next_hop
-        send = ["clear"]
-        packet_cmd = (
-            f"pkt -p {tx_port} -s "
-            f"Ether(src='{tx_mac}',dst='{tx_reply['mac']}')/"
-            f"IP(src='{traffic_src_ip}',dst='{traffic_dst_ip}')/"
-            f"UDP(sport={udp_src_port},dport={udp_dst_port})/"
-            f"('x'*{payload_bytes})"
-        )
-        send.extend([packet_cmd] * packets)
-        send.extend(["stats", "release -p " + " ".join(str(port) for port in ports)])
-        traffic_batch = self.launcher.run_console_batch(
-            send,
-            password=password,
+        if rate is not None:
+            stream_specs = [
+                {
+                    "kind": "l3",
+                    "port": tx_port,
+                    "src_mac": tx_mac,
+                    "dst_mac": tx_reply["mac"],
+                    "src_ip": traffic_src_ip,
+                    "dst_ip": traffic_dst_ip,
+                    "protocol": "udp",
+                    "udp_src_port": udp_src_port,
+                    "udp_dst_port": udp_dst_port,
+                    "frame_size": 14 + 20 + 8 + payload_bytes,
+                }
+            ]
+            remote_ports = [tx_port]
+            if rx_port is not None:
+                remote_ports.append(rx_port)
+            remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
+                ports=remote_ports,
+                stream_specs=stream_specs,
+                rate=rate,
+                duration=duration,
+                password=password,
+            )
+            tx_packets = metrics.get("opackets", {}).get(tx_port, 0)
+            tx_bytes = metrics.get("obytes", {}).get(tx_port, 0)
+            tx_errors = metrics.get("oerrors", {}).get(tx_port, 0)
+            summary = {
+                "mode": "stream",
+                "rate": rate,
+                "duration": duration,
+                "tx_port": tx_port,
+                "tx_mac": tx_mac,
+                "tx_src_ip": tx_src_ip,
+                "tx_next_hop": tx_next_hop,
+                "resolved_nh_mac": tx_reply["mac"],
+                "traffic_src_ip": traffic_src_ip,
+                "traffic_dst_ip": traffic_dst_ip,
+                "packets_sent": tx_packets,
+                "bytes_sent": tx_bytes,
+                "tx_errors": tx_errors,
+                "batch_success": remote_success,
+            }
+            success = remote_success and tx_packets > 0 and tx_errors == 0
+            if rx_port is not None:
+                rx_packets = metrics.get("ipackets", {}).get(rx_port, 0)
+                rx_bytes = metrics.get("ibytes", {}).get(rx_port, 0)
+                rx_errors = metrics.get("ierrors", {}).get(rx_port, 0)
+                summary.update(
+                    {
+                        "rx_port": rx_port,
+                        "packets_received": rx_packets,
+                        "bytes_received": rx_bytes,
+                        "rx_errors": rx_errors,
+                        "packet_loss": loss_count(tx_packets, rx_packets),
+                        "packet_loss_pct": loss_percent(tx_packets, rx_packets),
+                    }
+                )
+                success = success and rx_packets > 0 and rx_errors == 0
+            if payload.get("error"):
+                summary["error"] = payload["error"]
+            return TrexTrafficResult("l3", success, summary, metrics, {"setup": setup_batch.output, "traffic": remote_output})
+
+        remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
             ports=ports,
-            force_acquire=True,
-            readonly=False,
-            timeout=max(40.0, float(packets) * 1.5),
+            stream_specs=[
+                {
+                    "kind": "l3",
+                    "port": tx_port,
+                    "src_mac": tx_mac,
+                    "dst_mac": tx_reply["mac"],
+                    "src_ip": traffic_src_ip,
+                    "dst_ip": traffic_dst_ip,
+                    "protocol": "udp",
+                    "udp_src_port": udp_src_port,
+                    "udp_dst_port": udp_dst_port,
+                    "frame_size": 14 + 20 + 8 + payload_bytes,
+                }
+            ],
+            count=int(packets),
+            packet_pps=packet_pps,
+            password=password,
         )
-        metrics = self.parse_summary(traffic_batch.output)
         tx_packets = metrics.get("opackets", {}).get(tx_port, 0)
         tx_bytes = metrics.get("obytes", {}).get(tx_port, 0)
         tx_errors = metrics.get("oerrors", {}).get(tx_port, 0)
         summary: dict[str, Any] = {
+            "mode": "packet",
             "tx_port": tx_port,
             "tx_mac": tx_mac,
             "tx_src_ip": tx_src_ip,
@@ -538,13 +962,16 @@ class TrexTraffic:
             "resolved_nh_mac": tx_reply["mac"],
             "traffic_src_ip": traffic_src_ip,
             "traffic_dst_ip": traffic_dst_ip,
-            "packets_asked": packets,
+            "packet_pps": packet_pps,
+            "packets_asked": int(packets),
             "packets_sent": tx_packets,
             "bytes_sent": tx_bytes,
             "tx_errors": tx_errors,
-            "batch_success": traffic_batch.success,
+            "batch_success": remote_success,
         }
-        success = traffic_batch.success and tx_packets == packets and tx_errors == 0
+        if payload.get("error"):
+            summary["error"] = payload["error"]
+        success = remote_success and tx_packets == packets and tx_errors == 0
         if rx_port is not None:
             rx_packets = metrics.get("ipackets", {}).get(rx_port, 0)
             rx_bytes = metrics.get("ibytes", {}).get(rx_port, 0)
@@ -565,13 +992,13 @@ class TrexTraffic:
             success,
             summary,
             metrics,
-            {"setup": setup_batch.output, "traffic": traffic_batch.output},
+            {"setup": setup_batch.output, "traffic": remote_output},
         )
 
     def run_l3_bidirectional(
         self,
         *,
-        packets: int,
+        packets: int | None = None,
         port_a_src_ip: str,
         port_b_src_ip: str,
         traffic_a_dst_ip: str,
@@ -587,10 +1014,18 @@ class TrexTraffic:
         udp_dst_port: int = 12,
         port_a_mac: str | None = None,
         port_b_mac: str | None = None,
+        rate: str | None = None,
+        duration: float = 10.0,
+        packet_pps: int = 50,
         password: str | None = None,
     ) -> TrexTrafficResult:
-        if packets < 1:
-            raise ValueError("packets must be at least 1")
+        if rate is None:
+            if packets is None or packets < 1:
+                raise ValueError("packets must be at least 1 when rate is not provided")
+        elif duration <= 0:
+            raise ValueError("duration must be greater than 0 when rate is provided")
+        if packet_pps < 1:
+            raise ValueError("packet_pps must be at least 1")
 
         port_a_mac, port_b_mac = self._resolve_two_port_macs(port_a, port_b, port_a_mac, port_b_mac, password=password)
         setup_batch: TrexConsoleBatchResult | None = None
@@ -627,38 +1062,15 @@ class TrexTraffic:
                 force_acquire=True,
                 readonly=False,
                 timeout=60.0,
+                delay_after_acquire=self.launcher.config.acquire_settle_time,
             )
             arp_replies = self.parse_arp_replies(setup_batch.output)
             try:
                 port_a_next_hop_mac = arp_replies[port_a]["mac"]
                 port_b_next_hop_mac = arp_replies[port_b]["mac"]
             except KeyError:
-                return TrexTrafficResult(
-                    "l3_bidirectional",
-                    False,
-                    {
-                        "port_a": port_a,
-                        "port_b": port_b,
-                        "port_a_mac": port_a_mac,
-                        "port_b_mac": port_b_mac,
-                        "port_a_src_ip": port_a_src_ip,
-                        "port_b_src_ip": port_b_src_ip,
-                        "traffic_a_dst_ip": traffic_a_dst_ip,
-                        "traffic_b_dst_ip": traffic_b_dst_ip,
-                        "port_a_next_hop_mac": port_a_next_hop_mac,
-                        "port_b_next_hop_mac": port_b_next_hop_mac,
-                        "packets_per_port": packets,
-                        "batch_success": setup_batch.success,
-                    },
-                    {},
-                    {"setup": setup_batch.output},
-                )
-
-        if not setup_batch.success:
-            return TrexTrafficResult(
-                "l3_bidirectional",
-                False,
-                {
+                summary: dict[str, Any] = {
+                    "mode": "stream" if rate is not None else "packet",
                     "port_a": port_a,
                     "port_b": port_b,
                     "port_a_mac": port_a_mac,
@@ -669,41 +1081,175 @@ class TrexTraffic:
                     "traffic_b_dst_ip": traffic_b_dst_ip,
                     "port_a_next_hop_mac": port_a_next_hop_mac,
                     "port_b_next_hop_mac": port_b_next_hop_mac,
-                    "packets_per_port": packets,
-                    "batch_success": False,
-                },
+                    "batch_success": setup_batch.success,
+                    "error": "setup failed before traffic start",
+                }
+                if rate is not None:
+                    summary.update({"rate": rate, "duration": duration})
+                else:
+                    summary["packets_per_port"] = int(packets) if packets is not None else None
+                return TrexTrafficResult(
+                    "l3_bidirectional",
+                    False,
+                    summary,
+                    {},
+                    {"setup": setup_batch.output},
+                )
+
+        if not setup_batch.success:
+            summary = {
+                "mode": "stream" if rate is not None else "packet",
+                "port_a": port_a,
+                "port_b": port_b,
+                "port_a_mac": port_a_mac,
+                "port_b_mac": port_b_mac,
+                "port_a_src_ip": port_a_src_ip,
+                "port_b_src_ip": port_b_src_ip,
+                "traffic_a_dst_ip": traffic_a_dst_ip,
+                "traffic_b_dst_ip": traffic_b_dst_ip,
+                "port_a_next_hop_mac": port_a_next_hop_mac,
+                "port_b_next_hop_mac": port_b_next_hop_mac,
+                "batch_success": False,
+                "error": "setup failed before traffic start",
+            }
+            if rate is not None:
+                summary.update({"rate": rate, "duration": duration})
+            else:
+                summary["packets_per_port"] = int(packets) if packets is not None else None
+            return TrexTrafficResult(
+                "l3_bidirectional",
+                False,
+                summary,
                 {},
                 {"setup": setup_batch.output},
             )
 
-        send = ["clear"]
-        pkt_a = (
-            f"pkt -p {port_a} -s "
-            f"Ether(src='{port_a_mac}',dst='{port_a_next_hop_mac}')/"
-            f"IP(src='{port_a_src_ip}',dst='{traffic_a_dst_ip}')/"
-            f"UDP(sport={udp_src_port},dport={udp_dst_port})/"
-            f"('x'*{payload_bytes})"
-        )
-        pkt_b = (
-            f"pkt -p {port_b} -s "
-            f"Ether(src='{port_b_mac}',dst='{port_b_next_hop_mac}')/"
-            f"IP(src='{port_b_src_ip}',dst='{traffic_b_dst_ip}')/"
-            f"UDP(sport={udp_src_port},dport={udp_dst_port})/"
-            f"('x'*{payload_bytes})"
-        )
-        for _ in range(packets):
-            send.append(pkt_a)
-            send.append(pkt_b)
-        send.extend(["stats", f"release -p {port_a} {port_b}"])
-        traffic_batch = self.launcher.run_console_batch(
-            send,
-            password=password,
+        if rate is not None:
+            remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
+                ports=[port_a, port_b],
+                stream_specs=[
+                    {
+                        "kind": "l3",
+                        "port": port_a,
+                        "src_mac": port_a_mac,
+                        "dst_mac": port_a_next_hop_mac,
+                        "src_ip": port_a_src_ip,
+                        "dst_ip": traffic_a_dst_ip,
+                        "protocol": "udp",
+                        "udp_src_port": udp_src_port,
+                        "udp_dst_port": udp_dst_port,
+                        "frame_size": 14 + 20 + 8 + payload_bytes,
+                    },
+                    {
+                        "kind": "l3",
+                        "port": port_b,
+                        "src_mac": port_b_mac,
+                        "dst_mac": port_b_next_hop_mac,
+                        "src_ip": port_b_src_ip,
+                        "dst_ip": traffic_b_dst_ip,
+                        "protocol": "udp",
+                        "udp_src_port": udp_src_port,
+                        "udp_dst_port": udp_dst_port,
+                        "frame_size": 14 + 20 + 8 + payload_bytes,
+                    },
+                ],
+                rate=rate,
+                duration=duration,
+                password=password,
+            )
+            a_tx = metrics.get("opackets", {}).get(port_a, 0)
+            a_rx = metrics.get("ipackets", {}).get(port_a, 0)
+            b_tx = metrics.get("opackets", {}).get(port_b, 0)
+            b_rx = metrics.get("ipackets", {}).get(port_b, 0)
+            a_tx_bytes = metrics.get("obytes", {}).get(port_a, 0)
+            a_rx_bytes = metrics.get("ibytes", {}).get(port_a, 0)
+            b_tx_bytes = metrics.get("obytes", {}).get(port_b, 0)
+            b_rx_bytes = metrics.get("ibytes", {}).get(port_b, 0)
+            a_oerrors = metrics.get("oerrors", {}).get(port_a, 0)
+            a_ierrors = metrics.get("ierrors", {}).get(port_a, 0)
+            b_oerrors = metrics.get("oerrors", {}).get(port_b, 0)
+            b_ierrors = metrics.get("ierrors", {}).get(port_b, 0)
+            sent_total = a_tx + b_tx
+            received_total = a_rx + b_rx
+            summary = {
+                "mode": "stream",
+                "rate": rate,
+                "duration": duration,
+                "port_a": port_a,
+                "port_b": port_b,
+                "port_a_mac": port_a_mac,
+                "port_b_mac": port_b_mac,
+                "port_a_next_hop_mac": port_a_next_hop_mac,
+                "port_b_next_hop_mac": port_b_next_hop_mac,
+                "port_a_src_ip": port_a_src_ip,
+                "port_b_src_ip": port_b_src_ip,
+                "traffic_a_dst_ip": traffic_a_dst_ip,
+                "traffic_b_dst_ip": traffic_b_dst_ip,
+                "port_a_sent": a_tx,
+                "port_a_received": a_rx,
+                "port_b_sent": b_tx,
+                "port_b_received": b_rx,
+                "port_a_tx_bytes": a_tx_bytes,
+                "port_a_rx_bytes": a_rx_bytes,
+                "port_b_tx_bytes": b_tx_bytes,
+                "port_b_rx_bytes": b_rx_bytes,
+                "loss_a_to_b": loss_count(a_tx, b_rx),
+                "loss_a_to_b_pct": loss_percent(a_tx, b_rx),
+                "loss_b_to_a": loss_count(b_tx, a_rx),
+                "loss_b_to_a_pct": loss_percent(b_tx, a_rx),
+                "total_sent": sent_total,
+                "total_received": received_total,
+                "total_loss": loss_count(sent_total, received_total),
+                "total_loss_pct": loss_percent(sent_total, received_total),
+                "port_a_tx_errors": a_oerrors,
+                "port_a_rx_errors": a_ierrors,
+                "port_b_tx_errors": b_oerrors,
+                "port_b_rx_errors": b_ierrors,
+                "batch_success": remote_success,
+            }
+            if payload.get("error"):
+                summary["error"] = payload["error"]
+            success = remote_success and a_tx > 0 and a_rx > 0 and b_tx > 0 and b_rx > 0 and a_oerrors == 0 and a_ierrors == 0 and b_oerrors == 0 and b_ierrors == 0
+            return TrexTrafficResult(
+                "l3_bidirectional",
+                success,
+                summary,
+                metrics,
+                {"setup": setup_batch.output, "traffic": remote_output},
+            )
+
+        remote_success, payload, metrics, remote_output = self._run_remote_stl_streams(
             ports=[port_a, port_b],
-            force_acquire=True,
-            readonly=False,
-            timeout=max(40.0, float(packets) * 3.0),
+            stream_specs=[
+                {
+                    "kind": "l3",
+                    "port": port_a,
+                    "src_mac": port_a_mac,
+                    "dst_mac": port_a_next_hop_mac,
+                    "src_ip": port_a_src_ip,
+                    "dst_ip": traffic_a_dst_ip,
+                    "protocol": "udp",
+                    "udp_src_port": udp_src_port,
+                    "udp_dst_port": udp_dst_port,
+                    "frame_size": 14 + 20 + 8 + payload_bytes,
+                },
+                {
+                    "kind": "l3",
+                    "port": port_b,
+                    "src_mac": port_b_mac,
+                    "dst_mac": port_b_next_hop_mac,
+                    "src_ip": port_b_src_ip,
+                    "dst_ip": traffic_b_dst_ip,
+                    "protocol": "udp",
+                    "udp_src_port": udp_src_port,
+                    "udp_dst_port": udp_dst_port,
+                    "frame_size": 14 + 20 + 8 + payload_bytes,
+                },
+            ],
+            count=int(packets),
+            packet_pps=packet_pps,
+            password=password,
         )
-        metrics = self.parse_summary(traffic_batch.output)
         a_tx = metrics.get("opackets", {}).get(port_a, 0)
         a_rx = metrics.get("ipackets", {}).get(port_a, 0)
         b_tx = metrics.get("opackets", {}).get(port_b, 0)
@@ -719,6 +1265,7 @@ class TrexTraffic:
         sent_total = a_tx + b_tx
         received_total = a_rx + b_rx
         summary = {
+            "mode": "packet",
             "port_a": port_a,
             "port_b": port_b,
             "port_a_mac": port_a_mac,
@@ -729,7 +1276,8 @@ class TrexTraffic:
             "port_b_src_ip": port_b_src_ip,
             "traffic_a_dst_ip": traffic_a_dst_ip,
             "traffic_b_dst_ip": traffic_b_dst_ip,
-            "packets_per_port": packets,
+            "packet_pps": packet_pps,
+            "packets_per_port": int(packets),
             "port_a_sent": a_tx,
             "port_a_received": a_rx,
             "port_b_sent": b_tx,
@@ -750,10 +1298,12 @@ class TrexTraffic:
             "port_a_rx_errors": a_ierrors,
             "port_b_tx_errors": b_oerrors,
             "port_b_rx_errors": b_ierrors,
-            "batch_success": traffic_batch.success,
+            "batch_success": remote_success,
         }
+        if payload.get("error"):
+            summary["error"] = payload["error"]
         success = (
-            traffic_batch.success
+            remote_success
             and a_tx == packets
             and a_rx == packets
             and b_tx == packets
@@ -768,7 +1318,7 @@ class TrexTraffic:
             success,
             summary,
             metrics,
-            {"setup": setup_batch.output, "traffic": traffic_batch.output},
+            {"setup": setup_batch.output, "traffic": remote_output},
         )
 
     def run_ping(
@@ -800,7 +1350,8 @@ class TrexTraffic:
                 ports=[probe.port],
                 force_acquire=True,
                 readonly=False,
-                timeout=max(40.0, float(count) * 3.0),
+                timeout=max(60.0, float(count) * 5.0 + 10.0),
+                delay_after_acquire=self.launcher.config.acquire_settle_time,
             )
             outputs[f"port_{probe.port}"] = batch.output
             arp_replies = self.parse_arp_replies(batch.output)

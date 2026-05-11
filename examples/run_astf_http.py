@@ -29,6 +29,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from trexcmllib import TrexConsoleConfig, TrexTraffic
+from trexcmllib.examples.common import add_console_target_args, add_traffic_reset_args, console_target_kwargs, validate_console_target_args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,13 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--cml-host", "--jump-host", dest="jump_host", required=True, help="CML terminal server hostname or IP")
-    parser.add_argument("--lab-name", required=True, help="CML lab name")
-    parser.add_argument("--node-name", required=True, help="TRex node name in the lab")
-    parser.add_argument("--node-port", default="0", help="CML console line index (default: 0)")
-    parser.add_argument("--user", required=True, help="SSH username for the CML host")
-    parser.add_argument("--password", default=None, help="SSH password for the CML host")
-    parser.add_argument("--password-env", default="TREXCMLLIB_PASSWORD", help="Environment variable used for the SSH password")
+    add_console_target_args(parser)
+    add_traffic_reset_args(parser)
     parser.add_argument("--profile", default="astf/http_simple.py", help="ASTF HTTP profile path (default: astf/http_simple.py)")
     parser.add_argument("--profile-id", default="http", help="ASTF profile id used for dynamic profile stats (default: http)")
     parser.add_argument("--multiplier", default="100", help="ASTF multiplier passed to start -m (default: 100)")
@@ -61,21 +57,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ipv6", action="store_true", help="Run the ASTF profile in IPv6 mode")
     return parser
 def main() -> int:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_console_target_args(parser, args)
     traffic = TrexTraffic(
         TrexConsoleConfig(
-            jump_host=args.jump_host,
-            user=args.user,
-            lab_name=args.lab_name,
-            node_name=args.node_name,
-            node_port=str(args.node_port),
-            password=args.password,
-            password_env=args.password_env,
+            **console_target_kwargs(args),
             server_mode="astf",
             readonly=False,
             force_acquire=False,
             server_wait=6.0,
-        )
+        ),
+        hard_reset=args.hard_reset,
     )
     result = traffic.run(
         "astf_http",
