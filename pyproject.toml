@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Helpers for driving Cisco TRex nodes through CML console and STL workflows"
 readme = "README.md"
 requires-python = ">=3.10"
+authors = [
+  { name = "DNACENSolutions" },
+]
 keywords = ["trex", "cml", "cisco", "traffic-generator", "stl"]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -27,8 +30,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/cisco-system-traffic-generator/trex-core"
-Repository = "https://github.com/cisco-system-traffic-generator/trex-core"
+Homepage = "https://github.com/DNACENSolutions/trexcmllib"
+Repository = "https://github.com/DNACENSolutions/trexcmllib"
+Issues = "https://github.com/DNACENSolutions/trexcmllib/issues"
 
 [project.scripts]
 trexcmllib-open-console = "trexcmllib.examples.open_console:main"

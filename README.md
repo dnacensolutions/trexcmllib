@@ -21,7 +21,32 @@ This library was built to solve practical lab tasks:
 
 ## Status
 
-This is currently a repo-local library under [scripts/trexcmllib](/Users/pawansi/workspace/trex-core/scripts/trexcmllib). It now includes package metadata in [pyproject.toml](/Users/pawansi/workspace/trex-core/scripts/trexcmllib/pyproject.toml) and example console-script entrypoints.
+This repository is structured as an installable Python package and includes:
+
+- package metadata in `pyproject.toml`
+- example console-script entrypoints
+- GitHub Actions workflows for linting and publishing
+
+The package is designed for publishing to PyPI, but the runtime workflows still depend on external lab infrastructure such as a reachable CML host and a TRex node.
+
+## Installation
+
+Install from a local checkout:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+Build local distributions:
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+```
 
 ## Dependencies
 
@@ -466,7 +491,29 @@ For the ASTF examples:
 - `run_astf_udp.py` defaults to `astf/udp_pcap.py`
 - these examples validate stateful counters such as `tcps_connects` or `udps_connects` and byte symmetry between client and server
 
-## Recommended Next Steps Before Publishing
+## Publishing
+
+This repository includes a GitHub Actions workflow for PyPI Trusted Publishing.
+
+Recommended flow:
+
+1. Create the project on PyPI and TestPyPI.
+2. Configure Trusted Publishers on both indexes for this GitHub repository and workflow file.
+3. Run the workflow manually to publish to TestPyPI.
+4. Verify installation from TestPyPI.
+5. Create a GitHub release to publish to PyPI.
+
+Manual build and upload remains available if you prefer `twine`:
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+python -m twine upload --repository testpypi dist/*
+python -m twine upload dist/*
+```
+
+## Recommended Next Steps
 
 - add automated tests for output parsing and batch success detection
 - add CI for `py_compile`, packaging, and example `--help` smoke tests
